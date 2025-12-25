@@ -731,7 +731,7 @@ has_severity = bool(re.search(r"\bP[0-5]\b", normalized))
 system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要额外文字），格式如下：
 {
   "issues": [
-    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "简短中文概述", "suggestion": "简短中文建议"}
+    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "中文概述", "suggestion": "中文建议"}
   ]
 }
 要求：
@@ -739,7 +739,7 @@ system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要�
 - summary/suggestion 不要输出代码或尖括号内容
 - 不要输出 PR 编号或链接
 - 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
-- summary/suggestion 各不超过 50 字"""
+- summary/suggestion 需保留关键背景与影响，可用 1-3 句"""
 
 user_prompt = f"仓库: {repo}\n分支: {branch}\n位置: {location or '未知'}\n原始审查内容:\n{normalized}"
 
