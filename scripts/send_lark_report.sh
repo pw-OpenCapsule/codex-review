@@ -18,24 +18,23 @@ REPORT_DATE="${DATE_INPUT:-$(TZ="$TZ" date +%F)}"
 RUN_FILE="$RUN_DIR/run-$REPORT_DATE.tsv"
 TODAY="$(TZ="$TZ" date +%F)"
 TARGET_ENTRY="${RETRY_ONLY:-}"
+SELF_GH_LOGIN="${SELF_GH_LOGIN:-}"
+
+if [[ -z "$SELF_GH_LOGIN" ]]; then
+  SELF_GH_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
+fi
 
 if [[ "$REPORT_DATE" != "$TODAY" && "${LARK_DRY_RUN:-0}" != "1" ]]; then
   log "报告日期非今日，跳过发送：$REPORT_DATE"
   exit 0
 fi
 
-report_marker() {
-  printf 'codex-review-report-sent:%s' "$REPORT_DATE"
-}
-
 report_already_sent() {
   local gh_repo="$1"
   local pr_number="$2"
-  local marker
   local already
 
-  marker="$(report_marker)"
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq "[.comments[].body | contains(\"$marker\")] | any")"
+  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("已发送日报")] | any')"
   [[ "$already" == "true" ]]
 }
 
@@ -73,16 +72,15 @@ post_report_comment() {
   local gh_repo="$1"
   local pr_number="$2"
   local content="$3"
-  local marker
   local normalized
 
-  marker="$(report_marker)"
   normalized="$(normalize_for_pr_comment "$content")"
   if [[ -z "$(printf '%s' "$normalized" | tr -d '[:space:]')" ]]; then
     normalized="审查结果已发送。"
   fi
 
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "<!-- ${marker} -->"$'\n\n'"$normalized" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "$normalized" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "已发送日报" >/dev/null
 }
 
 codex_setup_required() {
@@ -94,6 +92,43 @@ import re
 
 text = os.environ.get("REVIEW_TEXT", "")
 if re.search(r"To use Codex here,", text, flags=re.IGNORECASE):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+review_has_no_issues() {
+  local review_text="$1"
+
+  REVIEW_TEXT="$review_text" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("REVIEW_TEXT", "")
+patterns = [
+    r"didn't find any major issues",
+    r"no major issues",
+    r"no issues found",
+    r"looks good to me",
+]
+for pat in patterns:
+    if re.search(pat, text, flags=re.IGNORECASE):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+review_contains_severity() {
+  local review_text="$1"
+
+  REVIEW_TEXT="$review_text" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("REVIEW_TEXT", "")
+if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
+    raise SystemExit(0)
+if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -161,6 +196,14 @@ import re
 import sys
 
 text = os.environ.get("REVIEW_TEXT", "")
+m2 = re.search(r"^CODEX_LOCATION\t([0-9a-fA-F]{7,40})\t([^\t]+)\t(\d+)\t(\d+)$", text, flags=re.M)
+if m2:
+    commit = m2.group(1)
+    path = m2.group(2)
+    start = m2.group(3)
+    end = m2.group(4)
+    print(f"{commit}\t{path}\t{start}\t{end}")
+    sys.exit(0)
 m = re.search(r"https?://github.com/[^\s)]+/blob/([0-9a-fA-F]{7,40})/([^#\s)]+)#L(\d+)(?:-L(\d+))?", text)
 if not m:
     sys.exit(0)
@@ -181,6 +224,7 @@ get_code_snippet() {
   local end="$5"
   local branch="$6"
   local content=""
+  local context="${SNIPPET_CONTEXT:-3}"
 
   if [[ ! -d "$repo_dir/.git" ]]; then
     return 1
@@ -198,6 +242,21 @@ get_code_snippet() {
 
   if [[ -z "$content" ]]; then
     return 1
+  fi
+
+  if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$context" =~ ^[0-9]+$ ]]; then
+      context=0
+    fi
+    local start_num="$start"
+    local end_num="$end"
+    local adj_start=$((start_num - context))
+    local adj_end=$((end_num + context))
+    if (( adj_start < 1 )); then
+      adj_start=1
+    fi
+    printf '%s\n' "$content" | sed -n "${adj_start},${adj_end}p"
+    return 0
   fi
 
   printf '%s\n' "$content" | sed -n "${start},${end}p"
@@ -396,10 +455,14 @@ get_review_text() {
   local gh_repo="$1"
   local pr_number="$2"
   local pr_json
+  local review_comments_json
 
   pr_json="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments,reviews)"
+  review_comments_json="$(gh api "repos/$gh_repo/pulls/$pr_number/comments" 2>/dev/null || printf '[]')"
 
+  REVIEW_IGNORE_AUTHORS="${REVIEW_IGNORE_AUTHORS:-$SELF_GH_LOGIN}" \
   CODEX_REVIEW_AUTHOR="${CODEX_REVIEW_AUTHOR:-}" CODEX_PROMPT="${CODEX_PROMPT:-}" PR_JSON="$pr_json" \
+  REVIEW_COMMENTS_JSON="$review_comments_json" \
   python3 - <<'PY'
 import json
 import os
@@ -410,8 +473,11 @@ if not raw.strip():
     sys.exit(0)
 
 data = json.loads(raw)
+review_comments = json.loads(os.environ.get("REVIEW_COMMENTS_JSON", "[]") or "[]")
 author = os.environ.get("CODEX_REVIEW_AUTHOR") or ""
 prompt = os.environ.get("CODEX_PROMPT") or ""
+ignore_raw = os.environ.get("REVIEW_IGNORE_AUTHORS") or ""
+ignore = {item.strip().lower() for item in ignore_raw.split(",") if item.strip()}
 
 comments = data.get("comments") or []
 reviews = data.get("reviews") or []
@@ -419,20 +485,31 @@ reviews = data.get("reviews") or []
 def body_text(item):
     return item.get("body") if isinstance(item, dict) else None
 
+def author_login(item):
+    login = (item.get("author") or {}).get("login") if isinstance(item, dict) else ""
+    return (login or "").lower()
+
 texts = []
+location = None
 if author:
     for item in comments:
+        if author_login(item) in ignore:
+            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
                 texts.append(text)
     for item in reviews:
+        if author_login(item) in ignore:
+            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
                 texts.append(text)
 else:
     for item in comments:
+        if author_login(item) in ignore:
+            continue
         text = body_text(item)
         if not text:
             continue
@@ -440,9 +517,28 @@ else:
             continue
         texts.append(text)
     for item in reviews:
+        if author_login(item) in ignore:
+            continue
         text = body_text(item)
         if text:
             texts.append(text)
+
+for item in review_comments or []:
+    login = ((item.get("user") or {}).get("login") or "").lower()
+    if login and login in ignore:
+        continue
+    text = item.get("body")
+    if text:
+        texts.append(text)
+    if location is None:
+        path = item.get("path")
+        line = item.get("line") or item.get("original_line") or item.get("position")
+        commit = item.get("commit_id") or item.get("original_commit_id")
+        if path and line and commit:
+            location = (commit, path, str(line), str(line))
+
+if location:
+    texts.append(f"CODEX_LOCATION\t{location[0]}\t{location[1]}\t{location[2]}\t{location[3]}")
 
 print("\n".join(texts))
 PY
@@ -486,6 +582,9 @@ def normalize(text: str) -> str:
         "",
         text,
     )
+    text = re.sub(r"(?mi)^###\\s*💡\\s*Codex Review\\s*$", "", text)
+    text = re.sub(r"(?mi)^Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
+    text = re.sub(r"(?mi)^CODEX_LOCATION\\t.*$", "", text)
     def repl(m):
         path = m.group("path")
         lines = m.group("lines").replace("L", "")
@@ -495,24 +594,24 @@ def normalize(text: str) -> str:
         repl,
         text,
     )
-    text = text.replace("P0 Badge", "P0").replace("P1 Badge", "P1")
+    text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://\\S+", "", text)
     return text.strip()
 
 normalized = normalize(review_text)
-has_severity = bool(re.search(r"\\bP[01]\\b", normalized))
+has_severity = bool(re.search(r"\bP[0-5]\b", normalized))
 
 system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要额外文字），格式如下：
 {
   "issues": [
-    {"severity": "P0|P1", "summary": "简短中文概述", "suggestion": "简短中文建议"}
+    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "简短中文概述", "suggestion": "简短中文建议"}
   ]
 }
 要求：
 - 只输出中文，summary/suggestion 不要包含 URL 或 Markdown 链接
 - summary/suggestion 不要输出代码或尖括号内容
 - 不要输出 PR 编号或链接
-- 如果原始审查没有明确 P0/P1，则输出 {"issues": []}
+- 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
 - summary/suggestion 各不超过 50 字"""
 
 user_prompt = f"仓库: {repo}\n分支: {branch}\n位置: {location or '未知'}\n原始审查内容:\n{normalized}"
@@ -590,6 +689,10 @@ text = re.sub(
     "",
     text,
 )
+text = re.sub(r"(?mi)^###\\s*💡\\s*Codex Review\\s*$", "", text)
+text = re.sub(r"(?mi)^Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
+text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
+text = re.sub(r"(?mi)^CODEX_LOCATION\\t.*$", "", text)
 
 def repl(m):
     path = m.group("path")
@@ -616,18 +719,18 @@ fallback_summary() {
   local severity=""
   local cleaned=""
 
-  issues="$(printf '%s\n' "$review_text" | grep -E 'P0|P1' | head -n 5 || true)"
+  issues="$(printf '%s\n' "$review_text" | grep -E 'P[0-5]' | head -n 5 || true)"
   if [[ -n "$issues" ]]; then
     first_line="$(printf '%s\n' "$issues" | head -n 1)"
-    if [[ "$first_line" == *P0* ]]; then
-      severity="P0"
+    if [[ "$first_line" =~ (P[0-5]) ]]; then
+      severity="${BASH_REMATCH[1]}"
     else
       severity="P1"
     fi
     cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\\*\\*//g; s/!\\[[^]]*\\]\\([^)]*\\)//g')"
     printf '%s\t%s\t%s\n' "$severity" "$cleaned" ""
   else
-    printf '%s\t%s\t%s\n' "NONE" "无 P0/P1 风险或审查未完成" ""
+    printf '%s\t%s\t%s\n' "NONE" "无 P0-P5 风险或审查未完成" ""
   fi
 }
 
@@ -666,6 +769,65 @@ build_run_file_from_prs() {
 if [[ ! -s "$RUN_FILE" ]]; then
   build_run_file_from_prs "$REPORT_DATE"
 fi
+
+log_missing_prs() {
+  local missing
+
+  missing="$(
+    RUN_FILE="$RUN_FILE" ROOT_DIR="$ROOT_DIR" DEFAULT_BRANCH="$DEFAULT_BRANCH" \
+    python3 - <<'PY'
+import os
+
+run_file = os.environ["RUN_FILE"]
+root_dir = os.environ["ROOT_DIR"]
+default_branch = os.environ.get("DEFAULT_BRANCH", "main")
+
+entries = set()
+if os.path.exists(run_file):
+    with open(run_file, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            entries.add(f"{parts[0]}@{parts[1]}")
+
+config_path = os.path.join(root_dir, "config", "repos.txt")
+if not os.path.exists(config_path):
+    raise SystemExit(0)
+
+missing = []
+with open(config_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "@" in line:
+            path, branch = line.split("@", 1)
+            branch = branch.strip() or default_branch
+        else:
+            path = line.strip()
+            branch = default_branch
+        key = f"{path}@{branch}"
+        if key not in entries:
+            missing.append(key)
+
+for item in missing:
+    print(item)
+PY
+  )"
+
+  if [[ -n "$missing" ]]; then
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      log "未找到 PR，跳过：$item"
+    done <<< "$missing"
+  fi
+}
+
+log_missing_prs
 
 build_payload() {
   local title="$1"
@@ -805,6 +967,16 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
+    if review_has_no_issues "$review_text"; then
+      log "审查无风险项，跳过发送：$gitlab_path@$branch"
+      continue
+    fi
+
+    if ! review_contains_severity "$review_text"; then
+      log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
+      continue
+    fi
+
     location_info="$(extract_location "$review_text")"
     location=""
     snippet=""
@@ -827,18 +999,20 @@ if [[ -s "$RUN_FILE" ]]; then
       if [[ -n "$summary_lines" ]]; then
         while IFS=$'\t' read -r severity summary suggestion; do
           [[ -z "$severity" || "$severity" == "NONE" ]] && continue
-          if [[ "$severity" == "P0" ]]; then
-            if [[ "$use_rich_tags" -eq 1 ]]; then
-              line="- <text_tag color='red'>P0</text_tag> $summary"
-            else
-              line="- [P0] $summary"
-            fi
+          color="orange"
+          label="$severity"
+          case "$severity" in
+            P0) color="red" ;;
+            P1) color="orange" ;;
+            P2) color="yellow" ;;
+            P3) color="blue" ;;
+            P4) color="green" ;;
+            P5) color="neutral" ;;
+          esac
+          if [[ "$use_rich_tags" -eq 1 ]]; then
+            line="- <text_tag color='$color'>$label</text_tag> $summary"
           else
-            if [[ "$use_rich_tags" -eq 1 ]]; then
-              line="- <text_tag color='orange'>P1</text_tag> $summary"
-            else
-              line="- [P1] $summary"
-            fi
+            line="- [$label] $summary"
           fi
           if [[ -n "$location" || -n "$suggestion" ]]; then
             line+="（"
@@ -906,6 +1080,7 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
     post_report_comment "$gh_repo" "$pr_number" "$content"
+    log "已发送日报：$gitlab_path@$branch"
     sent_any=1
   done < "$RUN_FILE"
 fi

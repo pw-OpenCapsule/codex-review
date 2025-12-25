@@ -35,11 +35,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${GOGS_BASE_URL:-}" ]]; then
-  die "GOGS_BASE_URL 为空"
+  if [[ -n "${GITLAB_HOST:-}" ]]; then
+    proto="${GITLAB_PROTOCOL:-https}"
+    GOGS_BASE_URL="${proto}://${GITLAB_HOST}"
+  else
+    die "GOGS_BASE_URL 为空"
+  fi
 fi
 
 if [[ -z "${GOGS_TOKEN:-}" ]]; then
-  die "GOGS_TOKEN 为空"
+  if [[ -n "${GITLAB_AUTH:-}" && "$GITLAB_AUTH" == *:* ]]; then
+    GOGS_TOKEN="${GITLAB_AUTH#*:}"
+  else
+    die "GOGS_TOKEN 为空"
+  fi
 fi
 
 if [[ "$mode" != "all" && "$mode" != "user" && "$mode" != "org" ]]; then
