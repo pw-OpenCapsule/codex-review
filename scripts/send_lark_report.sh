@@ -817,14 +817,14 @@ text = re.sub(
     "",
     text,
 )
-text = re.sub(r"(?mi)^\\s*###\\s*💡\\s*Codex Review\\s*$", "", text)
-text = re.sub(r"(?mi)^\\s*Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
-text = re.sub(r"(?mi)^\\s*Useful\\? React with.*$", "", text)
+text = re.sub(r"(?mi)^\s*###\s*💡\s*Codex Review\s*$", "", text)
+text = re.sub(r"(?mi)^\s*Here are some automated review suggestions for this pull request\.?\s*$", "", text)
+text = re.sub(r"(?mi)^\s*Useful\? React with.*$", "", text)
 text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
-text = re.sub(r"(?mi)^\\s*CODEX_LOCATION\\b.*$", "", text)
-text = re.sub(r"<\\/?sub>", "", text)
-text = re.sub(r"!\\[(P[0-5])\\]\\([^)]*\\)", r"[\\1]", text)
-text = re.sub(r"!\\[[^\\]]*\\]\\([^)]*\\)", "", text)
+text = re.sub(r"(?mi)^\s*CODEX_LOCATION\b.*$", "", text)
+text = re.sub(r"</?sub>", "", text)
+text = re.sub(r"!\[(P[0-5])\]\([^)]*\)", r"[\1]", text)
+text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
 
 def repl(m):
     path = m.group("path")
@@ -832,12 +832,12 @@ def repl(m):
     return f"{path}:{lines}"
 
 text = re.sub(
-    r"https?://github.com/[^\\s)]+/blob/[^/]+/(?P<path>[^#\\s)]+)#(?P<lines>L\\d+(?:-L\\d+)?)",
+    r"https?://github.com/[^\s)]+/blob/[^/]+/(?P<path>[^#\s)]+)#(?P<lines>L\d+(?:-L\d+)?)",
     repl,
     text,
 )
-text = re.sub(r"https?://\\S+", "", text)
-text = re.sub(r"\\n{3,}", "\\n\\n", text)
+text = re.sub(r"https?://\S+", "", text)
+text = re.sub(r"\n{3,}", "\n\n", text)
 print(text.strip())
 PY
 }
