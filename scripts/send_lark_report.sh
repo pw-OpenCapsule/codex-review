@@ -1244,8 +1244,15 @@ if [[ -s "$RUN_FILE" ]]; then
           read -r pr_base pr_head <<< "$pr_range"
           intro_commit="$(find_intro_commit "$repo_path" "$pr_base" "$pr_head" "$path" || true)"
           if [[ -n "$intro_commit" ]]; then
-            read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
-            intro_commit_block="【引入提交】"$'\n'"- ${intro_sha:0:7} $intro_name $intro_subject"
+            IFS=$'\t' read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
+            intro_desc="${intro_sha:0:7}"
+            if [[ -n "$intro_name" ]]; then
+              intro_desc+=" $intro_name"
+            fi
+            if [[ -n "$intro_subject" ]]; then
+              intro_desc+=" $intro_subject"
+            fi
+            intro_commit_block="【引入提交】"$'\n\n'"- $intro_desc"
             intro_line="$(format_single_mention "引入人" "$intro_name" "$intro_email" || true)"
           fi
         fi
@@ -1305,7 +1312,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
       commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
       if [[ -n "$commit_lines" ]]; then
-        commit_block="【提交】"$'\n'
+        commit_block="【提交】"$'\n\n'
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
           commit_block+="- $line"$'\n'
@@ -1339,7 +1346,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ -n "$final_content" ]]; then
       final_content+=$'\n\n'
     fi
-    final_content+="【发现】"$'\n'
+    final_content+="【发现】"$'\n\n'
     final_content+="$content"
 
     if [[ -n "$snippet" ]]; then
