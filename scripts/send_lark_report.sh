@@ -146,6 +146,57 @@ raise SystemExit(1)
 PY
 }
 
+fetch_pr_commit_lines() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local limit="${3:-10}"
+  local json
+
+  if [[ -z "$gh_repo" || -z "$pr_number" ]]; then
+    return 1
+  fi
+  if [[ "$limit" -le 0 ]]; then
+    return 1
+  fi
+
+  json="$(gh api "repos/$gh_repo/pulls/$pr_number/commits?per_page=$limit" 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 1
+  fi
+
+  COMMITS_JSON="$json" python3 - <<'PY'
+import json
+import os
+
+raw = os.environ.get("COMMITS_JSON", "")
+if not raw.strip():
+    raise SystemExit(1)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    raise SystemExit(1)
+
+lines = []
+for item in data:
+    sha = (item.get("sha") or "")[:7]
+    commit = item.get("commit") or {}
+    msg = (commit.get("message") or "").splitlines()[0].strip()
+    author = (commit.get("author") or {}).get("name") or ""
+    if not msg:
+        continue
+    if author:
+        lines.append(f"{sha} {author} {msg}")
+    else:
+        lines.append(f"{sha} {msg}")
+
+if not lines:
+    raise SystemExit(1)
+
+print("\n".join(lines))
+PY
+}
+
 resolve_lark_webhook() {
   if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
     if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
@@ -1084,25 +1135,43 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
-    if [[ -n "$mention_line" ]]; then
-      content="$mention_line"$'\n\n'"$content"
+    commit_block=""
+    commit_limit="${COMMIT_LOG_LIMIT:-10}"
+    if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
+      commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
+      if [[ -n "$commit_lines" ]]; then
+        commit_block="**提交：**"$'\n'
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          commit_block+="- $line"$'\n'
+        done <<< "$commit_lines"
+      fi
     fi
+
+    final_content=""
+    if [[ -n "$mention_line" ]]; then
+      final_content+="$mention_line"$'\n\n'
+    fi
+    if [[ -n "$commit_block" ]]; then
+      final_content+="$commit_block"$'\n'
+    fi
+    final_content+="$content"
 
     if [[ -n "$snippet" ]]; then
       lang="$(code_lang "$path")"
-      content+=$'\n'"**代码片段：**"$'\n'
-      content+='```'"$lang"$'\n'
-      content+="$snippet"$'\n'
-      content+='```'$'\n'
+      final_content+=$'\n'"**代码片段：**"$'\n'
+      final_content+='```'"$lang"$'\n'
+      final_content+="$snippet"$'\n'
+      final_content+='```'$'\n'
     fi
 
     title="每日代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
-    payload="$(build_payload "$title" "$content")"
+    payload="$(build_payload "$title" "$final_content")"
 
     repo_slug="${gitlab_path//\//_}-${branch//\//-}"
     REPORT_TEXT_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.txt"
     REPORT_PAYLOAD_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.json"
-    printf '%s' "$content" > "$REPORT_TEXT_FILE"
+    printf '%s' "$final_content" > "$REPORT_TEXT_FILE"
     printf '%s' "$payload" > "$REPORT_PAYLOAD_FILE"
 
     if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
@@ -1123,7 +1192,7 @@ if [[ -s "$RUN_FILE" ]]; then
     fi
 
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
-      post_report_comment "$gh_repo" "$pr_number" "$content"
+      post_report_comment "$gh_repo" "$pr_number" "$final_content"
       log "已发送日报：$gitlab_path@$branch"
     else
       log "DRY_RUN=1，已发送测试日报：$gitlab_path@$branch"
