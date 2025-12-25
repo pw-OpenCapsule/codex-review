@@ -11,6 +11,8 @@ source "$SCRIPT_DIR/lib.sh"
 
 DRY_RUN=0
 REVIEW_RANGE="${REVIEW_RANGE:-yesterday}"
+LOG_YESTERDAY_COMMITS="${LOG_YESTERDAY_COMMITS:-1}"
+YESTERDAY_LOG_LIMIT="${YESTERDAY_LOG_LIMIT:-20}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -93,6 +95,37 @@ yesterday_range_shas() {
   fi
 
   printf '%s\t%s\n' "$base_sha" "$head_sha"
+}
+
+log_yesterday_commits() {
+  local dir="$1"
+  local base_sha="$2"
+  local head_sha="$3"
+  local gitlab_path="$4"
+  local branch="$5"
+  local limit="$YESTERDAY_LOG_LIMIT"
+  local total=0
+
+  if [[ "$LOG_YESTERDAY_COMMITS" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+    limit=20
+  fi
+
+  total="$(git -C "$dir" rev-list --count "${base_sha}..${head_sha}" 2>/dev/null || printf '0')"
+  if [[ "$total" -le 0 ]]; then
+    return 0
+  fi
+
+  mapfile -t commits < <(git -C "$dir" log --max-count="$limit" --pretty=format:'%h %an %s' "${base_sha}..${head_sha}")
+  for line in "${commits[@]}"; do
+    log "昨日提交 $gitlab_path@$branch: $line"
+  done
+  if (( total > limit )); then
+    log "昨日提交 $gitlab_path@$branch: ... 省略 $((total - limit)) 条"
+  fi
 }
 
 compute_score() {
@@ -244,6 +277,9 @@ collect_queue() {
 
     read -r score loc risk < <(compute_score "$dir" "$base_sha" "$head_sha")
     log "加入队列 $gitlab_path@$branch 评分=$score 行数=$loc 风险文件=$risk"
+    if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+      log_yesterday_commits "$dir" "$base_sha" "$head_sha" "$gitlab_path" "$branch"
+    fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$score" "$gitlab_path" "$branch" "$base_sha" "$head_sha" >> "$QUEUE_FILE"
   done < "$ROOT_DIR/config/repos.txt"
 }
