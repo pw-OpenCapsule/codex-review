@@ -212,6 +212,39 @@ resolve_lark_webhook() {
   printf '%s' "$LARK_WEBHOOK_URL"
 }
 
+check_lark_response() {
+  local body="$1"
+
+  RESPONSE_BODY="$body" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("RESPONSE_BODY", "").strip()
+if not raw:
+    sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+code = data.get("code")
+if code is None:
+    code = data.get("StatusCode")
+
+if code is None:
+    sys.exit(0)
+
+try:
+    code = int(code)
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if code == 0 else 1)
+PY
+}
+
 review_contains_severity() {
   local review_text="$1"
 
@@ -1190,9 +1223,23 @@ if [[ -s "$RUN_FILE" ]]; then
       log "DRY_RUN=1，使用测试 webhook 发送"
     fi
 
-    http_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' -d "$payload" "$webhook_url")"
+    response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$webhook_url")"
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
     if [[ "$http_code" != "200" ]]; then
       log "Lark 发送失败（HTTP $http_code），跳过标记：$gitlab_path@$branch"
+      if [[ -n "$body" ]]; then
+        log "Lark 响应: $body"
+      fi
+      continue
+    fi
+
+    if ! check_lark_response "$body"; then
+      log "Lark 返回错误，跳过标记：$gitlab_path@$branch"
+      if [[ -n "$body" ]]; then
+        log "Lark 响应: $body"
+      fi
       continue
     fi
 
