@@ -1063,12 +1063,12 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
-    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
-      if review_has_no_issues "$review_text"; then
-        log "审查无风险项，跳过发送：$gitlab_path@$branch"
-        continue
-      fi
+    if review_has_no_issues "$review_text"; then
+      log "审查无风险项，跳过发送：$gitlab_path@$branch"
+      continue
+    fi
 
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
       if ! review_contains_severity "$review_text"; then
         log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
         continue
