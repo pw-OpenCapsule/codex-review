@@ -118,6 +118,21 @@ raise SystemExit(1)
 PY
 }
 
+resolve_lark_webhook() {
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
+      die "LARK_WEBHOOK_URL_DRY 为空"
+    fi
+    printf '%s' "$LARK_WEBHOOK_URL_DRY"
+    return 0
+  fi
+
+  if [[ -z "$LARK_WEBHOOK_URL" ]]; then
+    die "LARK_WEBHOOK_URL 为空"
+  fi
+  printf '%s' "$LARK_WEBHOOK_URL"
+}
+
 review_contains_severity() {
   local review_text="$1"
 
@@ -1066,21 +1081,25 @@ if [[ -s "$RUN_FILE" ]]; then
       log "DRY_RUN=1，已生成报告：$REPORT_TEXT_FILE"
       log "DRY_RUN=1，已生成 payload：$REPORT_PAYLOAD_FILE"
       cat "$REPORT_TEXT_FILE"
-      sent_any=1
-      continue
     fi
 
-    if [[ -z "$LARK_WEBHOOK_URL" ]]; then
-      die "LARK_WEBHOOK_URL 为空"
+    webhook_url="$(resolve_lark_webhook)"
+    if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+      log "DRY_RUN=1，使用测试 webhook 发送"
     fi
 
-    http_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' -d "$payload" "$LARK_WEBHOOK_URL")"
+    http_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' -d "$payload" "$webhook_url")"
     if [[ "$http_code" != "200" ]]; then
       log "Lark 发送失败（HTTP $http_code），跳过标记：$gitlab_path@$branch"
       continue
     fi
-    post_report_comment "$gh_repo" "$pr_number" "$content"
-    log "已发送日报：$gitlab_path@$branch"
+
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      post_report_comment "$gh_repo" "$pr_number" "$content"
+      log "已发送日报：$gitlab_path@$branch"
+    else
+      log "DRY_RUN=1，已发送测试日报：$gitlab_path@$branch"
+    fi
     sent_any=1
   done < "$RUN_FILE"
 fi
