@@ -9,17 +9,41 @@ source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+DRY_RUN=0
+REVIEW_RANGE="${REVIEW_RANGE:-yesterday}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry|--dry-run|-n)
+      DRY_RUN=1
+      shift
+      ;;
+    *)
+      die "未知参数: $1"
+      ;;
+  esac
+done
+
 ensure_dirs
 
 TODAY="$(TZ="$TZ" date +%F)"
-RUN_FILE="$RUN_DIR/run-$TODAY.tsv"
-QUEUE_FILE="$RUN_DIR/queue-$TODAY.tsv"
+if [[ "$DRY_RUN" == "1" ]]; then
+  RUN_FILE="$RUN_DIR/run-$TODAY.dry.tsv"
+  QUEUE_FILE="$RUN_DIR/queue-$TODAY.dry.tsv"
+else
+  RUN_FILE="$RUN_DIR/run-$TODAY.tsv"
+  QUEUE_FILE="$RUN_DIR/queue-$TODAY.tsv"
+fi
 
 : > "$RUN_FILE"
 : > "$QUEUE_FILE"
 
 if ! gh auth status >/dev/null 2>&1; then
   die "gh 未登录"
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  log "DRY_RUN=1，仅模拟执行，不创建 PR/评论"
 fi
 
 resolve_initial_base() {
@@ -35,6 +59,40 @@ resolve_initial_base() {
 
   base_sha="$(git -C "$dir" rev-list --max-parents=0 "$head_sha" | tail -n 1)"
   printf '%s' "$base_sha"
+}
+
+yesterday_date() {
+  if TZ="$TZ" date -d "yesterday" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "yesterday" +%F
+  else
+    TZ="$TZ" date -v-1d +%F
+  fi
+}
+
+yesterday_range_shas() {
+  local dir="$1"
+  local ref="$2"
+  local yesterday
+  local start_ts
+  local end_ts
+  local head_sha
+  local base_sha
+
+  yesterday="$(yesterday_date)"
+  start_ts="${yesterday} 00:00:00"
+  end_ts="${yesterday} 23:59:59"
+
+  head_sha="$(git -C "$dir" rev-list -n 1 --before="$end_ts" "$ref" 2>/dev/null || true)"
+  if [[ -z "$head_sha" ]]; then
+    return 1
+  fi
+
+  base_sha="$(git -C "$dir" rev-list -n 1 --before="$start_ts" "$ref" 2>/dev/null || true)"
+  if [[ -z "$base_sha" ]]; then
+    base_sha="$head_sha"
+  fi
+
+  printf '%s\t%s\n' "$base_sha" "$head_sha"
 }
 
 compute_score() {
@@ -109,6 +167,11 @@ sync_from_gitlab() {
     return 1
   fi
 
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY_RUN=1，跳过推送 GitHub：$gitlab_path@$branch"
+    return 0
+  fi
+
   if ! git -C "$dir" push -f origin "$remote/$branch:refs/heads/$branch"; then
     log "推送到 GitHub 失败：$gitlab_path@$branch"
     return 1
@@ -116,7 +179,7 @@ sync_from_gitlab() {
 }
 
 collect_queue() {
-  local gitlab_path branch gh_repo dir head_sha base_sha score loc risk initial_ref
+  local gitlab_path branch gh_repo dir head_sha base_sha score loc risk initial_ref head_ref
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     local line
@@ -141,22 +204,41 @@ collect_queue() {
       continue
     fi
 
-    if ! head_sha="$(git -C "$dir" rev-parse "origin/$branch" 2>/dev/null)"; then
+    head_ref="origin/$branch"
+    if [[ "$DRY_RUN" == "1" && "${SYNC_FROM_GITLAB:-0}" == "1" ]]; then
+      head_ref="$(gitlab_remote_name)/$branch"
+    fi
+
+    if ! head_sha="$(git -C "$dir" rev-parse "$head_ref" 2>/dev/null)"; then
       log "分支不存在，跳过：$gitlab_path@$branch"
       continue
     fi
 
     initial_ref="${INITIAL_BASE:-origin/{branch}~1}"
     initial_ref="${initial_ref//\{branch\}/$branch}"
+    if [[ "$head_ref" != "origin/$branch" ]]; then
+      initial_ref="${initial_ref//origin\/$branch/$head_ref}"
+    fi
 
-    if [[ -f "$(state_file "$gitlab_path" "$branch")" ]]; then
+    if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+      if read -r base_sha head_sha < <(yesterday_range_shas "$dir" "$head_ref"); then
+        :
+      else
+        log "$gitlab_path@$branch 昨日无提交"
+        continue
+      fi
+    elif [[ -f "$(state_file "$gitlab_path" "$branch")" ]]; then
       base_sha="$(cat "$(state_file "$gitlab_path" "$branch")")"
     else
       base_sha="$(resolve_initial_base "$dir" "$head_sha" "$initial_ref")"
     fi
 
     if [[ "$base_sha" == "$head_sha" ]]; then
-      log "$gitlab_path@$branch 无变更"
+      if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+        log "$gitlab_path@$branch 昨日无变更"
+      else
+        log "$gitlab_path@$branch 无变更"
+      fi
       continue
     fi
 
@@ -172,6 +254,11 @@ create_or_find_pr() {
   local base_sha="$3"
   local head_sha="$4"
   local branch="$5"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY_RUN=1，跳过创建 PR：$gh_repo ($branch)"
+    printf '%s' "DRY_RUN"
+    return 0
+  fi
   local branch_slug="${branch//\//-}"
   local base_branch="audit/base/$TODAY-$branch_slug"
   local head_branch="audit/head/$TODAY-$branch_slug"
@@ -210,6 +297,10 @@ ensure_codex_comment() {
   local gh_repo="$1"
   local pr_number="$2"
 
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY_RUN=1，跳过评论：$gh_repo#$pr_number"
+    return 0
+  fi
   local already
   already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("@codex review")] | any')"
   if [[ "$already" == "true" ]]; then
@@ -238,6 +329,14 @@ process_queue() {
 
     gh_repo="$(github_repo "$gitlab_path")"
     dir="$(repo_dir "$gh_repo")"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "DRY_RUN=1 将创建 PR：$gitlab_path@$branch base=$base_sha head=$head_sha"
+      log "DRY_RUN=1 将评论：$CODEX_PROMPT"
+      count=$((count + 1))
+      sleep "$SLEEP_BETWEEN_SECONDS"
+      continue
+    fi
 
     pr_number="$(create_or_find_pr "$gh_repo" "$dir" "$base_sha" "$head_sha" "$branch")"
     if [[ -z "$pr_number" ]]; then
