@@ -222,7 +222,7 @@ find_intro_commit() {
     return 1
   fi
 
-  git -C "$repo_path" log --reverse --format='%H\t%an\t%ae\t%s' "${base_sha}..${head_sha}" -- "$file_path" | head -n 1
+  git -C "$repo_path" log --reverse --format='%H%x1f%an%x1f%ae%x1f%s' "${base_sha}..${head_sha}" -- "$file_path" | head -n 1
 }
 
 resolve_lark_webhook() {
@@ -238,6 +238,19 @@ resolve_lark_webhook() {
     die "LARK_WEBHOOK_URL 为空"
   fi
   printf '%s' "$LARK_WEBHOOK_URL"
+}
+
+gitlab_commit_url() {
+  local gitlab_path="$1"
+  local sha="$2"
+  local proto="${GITLAB_PROTOCOL:-https}"
+  local host="${GITLAB_HOST:-}"
+
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+
+  printf '%s://%s/%s/commit/%s' "$proto" "$host" "$gitlab_path" "$sha"
 }
 
 check_lark_response() {
@@ -1244,7 +1257,7 @@ if [[ -s "$RUN_FILE" ]]; then
           read -r pr_base pr_head <<< "$pr_range"
           intro_commit="$(find_intro_commit "$repo_path" "$pr_base" "$pr_head" "$path" || true)"
           if [[ -n "$intro_commit" ]]; then
-            IFS=$'\t' read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
+            IFS=$'\x1f' read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
             intro_desc="${intro_sha:0:7}"
             if [[ -n "$intro_name" ]]; then
               intro_desc+=" $intro_name"
@@ -1252,7 +1265,15 @@ if [[ -s "$RUN_FILE" ]]; then
             if [[ -n "$intro_subject" ]]; then
               intro_desc+=" $intro_subject"
             fi
-            intro_commit_block="【引入提交】"$'\n\n'"- $intro_desc"
+            intro_url="$(gitlab_commit_url "$gitlab_path" "$intro_sha" || true)"
+            if [[ -n "$intro_url" ]]; then
+              intro_commit_block="【引入提交】"$'\n\n'"• [${intro_sha:0:7}]($intro_url)"
+              if [[ -n "$intro_name" || -n "$intro_subject" ]]; then
+                intro_commit_block+=" $intro_name $intro_subject"
+              fi
+            else
+              intro_commit_block="【引入提交】"$'\n\n'"• $intro_desc"
+            fi
             intro_line="$(format_single_mention "引入人" "$intro_name" "$intro_email" || true)"
           fi
         fi
@@ -1315,7 +1336,7 @@ if [[ -s "$RUN_FILE" ]]; then
         commit_block="【提交】"$'\n\n'
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
-          commit_block+="- $line"$'\n'
+          commit_block+="• $line"$'\n'
         done <<< "$commit_lines"
         commit_block="$(printf '%s' "$commit_block" | sed 's/[[:space:]]*$//')"
       fi
@@ -1344,7 +1365,7 @@ if [[ -s "$RUN_FILE" ]]; then
       final_content+="$intro_commit_block"
     fi
     if [[ -n "$final_content" ]]; then
-      final_content+=$'\n\n'
+      final_content+=$'\n<br>\n<br>\n'
     fi
     final_content+="【发现】"$'\n\n'
     final_content+="$content"
