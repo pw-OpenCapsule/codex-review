@@ -1042,9 +1042,11 @@ if [[ -s "$RUN_FILE" ]]; then
       fi
     fi
 
-    if report_already_sent "$gh_repo" "$pr_number"; then
-      log "已发送日报，跳过：$gitlab_path@$branch"
-      continue
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      if report_already_sent "$gh_repo" "$pr_number"; then
+        log "已发送日报，跳过：$gitlab_path@$branch"
+        continue
+      fi
     fi
 
     review_text="$(get_review_text "$gh_repo" "$pr_number")"
@@ -1061,14 +1063,16 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
-    if review_has_no_issues "$review_text"; then
-      log "审查无风险项，跳过发送：$gitlab_path@$branch"
-      continue
-    fi
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      if review_has_no_issues "$review_text"; then
+        log "审查无风险项，跳过发送：$gitlab_path@$branch"
+        continue
+      fi
 
-    if ! review_contains_severity "$review_text"; then
-      log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
-      continue
+      if ! review_contains_severity "$review_text"; then
+        log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
+        continue
+      fi
     fi
 
     location_info="$(extract_location "$review_text")"
