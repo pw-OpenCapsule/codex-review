@@ -13,7 +13,35 @@ ensure_dirs
 
 ensure_gh_auth
 
-DATE_INPUT="${1:-}"
+usage() {
+  cat <<'EOF'
+Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n]
+  REPORT_DATE          指定报告日期（默认今天）
+  --dry, --dry-run, -n  发送到测试 webhook（不写 PR 标记）
+EOF
+}
+
+DATE_INPUT=""
+LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --dry|--dry-run|-n)
+      LARK_DRY_RUN=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$DATE_INPUT" ]]; then
+        DATE_INPUT="$arg"
+      else
+        die "未知参数：$arg"
+      fi
+      ;;
+  esac
+done
+
 REPORT_DATE="${DATE_INPUT:-$(TZ="$TZ" date +%F)}"
 RUN_FILE="$RUN_DIR/run-$REPORT_DATE.tsv"
 TODAY="$(TZ="$TZ" date +%F)"
