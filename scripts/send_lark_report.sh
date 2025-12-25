@@ -197,6 +197,34 @@ print("\n".join(lines))
 PY
 }
 
+get_pr_base_head() {
+  local gh_repo="$1"
+  local pr_number="$2"
+
+  gh pr view --repo "$gh_repo" "$pr_number" --json baseRefOid,headRefOid --jq '"\(.baseRefOid)\t\(.headRefOid)"' 2>/dev/null || true
+}
+
+find_intro_commit() {
+  local repo_path="$1"
+  local base_sha="$2"
+  local head_sha="$3"
+  local file_path="$4"
+
+  if [[ -z "$repo_path" || -z "$base_sha" || -z "$head_sha" || -z "$file_path" ]]; then
+    return 1
+  fi
+
+  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+    git -C "$repo_path" fetch origin >/dev/null 2>&1 || true
+  fi
+
+  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+    return 1
+  fi
+
+  git -C "$repo_path" log --reverse --format='%H\t%an\t%ae\t%s' "${base_sha}..${head_sha}" -- "$file_path" | head -n 1
+}
+
 resolve_lark_webhook() {
   if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
     if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
@@ -540,6 +568,34 @@ format_mention_line() {
     fi
   done
   printf '责任人: %s' "$joined"
+}
+
+format_single_mention() {
+  local label="$1"
+  local name="$2"
+  local email="$3"
+  local display=""
+  local lark_id=""
+
+  lark_id="$(lookup_lark_id "$email" "$name" || true)"
+  if [[ -n "$lark_id" ]]; then
+    printf '%s: <at id=%s></at>' "$label" "$lark_id"
+    return 0
+  fi
+
+  display="$name"
+  if [[ -z "$display" ]]; then
+    display="$email"
+  fi
+  if [[ -n "$email" && "$email" != "$display" ]]; then
+    display="$display ($email)"
+  fi
+  if [[ -n "$display" ]]; then
+    printf '%s: @%s' "$label" "$display"
+    return 0
+  fi
+
+  return 1
 }
 
 code_lang() {
@@ -1171,6 +1227,8 @@ if [[ -s "$RUN_FILE" ]]; then
     snippet=""
     path=""
     mention_line=""
+    intro_line=""
+    intro_commit_block=""
     if [[ -n "$location_info" ]]; then
       read -r commit path start end <<< "$location_info"
       location="${path}:${start}-${end}"
@@ -1179,6 +1237,18 @@ if [[ -s "$RUN_FILE" ]]; then
       authors_tsv="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
       if [[ -n "$authors_tsv" ]]; then
         mention_line="$(format_mention_line "$authors_tsv" || true)"
+      fi
+
+      if [[ -n "$repo_path" && -n "$path" ]]; then
+        if pr_range="$(get_pr_base_head "$gh_repo" "$pr_number")"; then
+          read -r pr_base pr_head <<< "$pr_range"
+          intro_commit="$(find_intro_commit "$repo_path" "$pr_base" "$pr_head" "$path" || true)"
+          if [[ -n "$intro_commit" ]]; then
+            read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
+            intro_commit_block="【引入提交】"$'\n'"- ${intro_sha:0:7} $intro_name $intro_subject"
+            intro_line="$(format_single_mention "引入人" "$intro_name" "$intro_email" || true)"
+          fi
+        fi
       fi
     fi
 
@@ -1248,11 +1318,23 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ -n "$mention_line" ]]; then
       final_content+="$mention_line"
     fi
+    if [[ -n "$intro_line" ]]; then
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n'
+      fi
+      final_content+="$intro_line"
+    fi
     if [[ -n "$commit_block" ]]; then
       if [[ -n "$final_content" ]]; then
         final_content+=$'\n\n'
       fi
       final_content+="$commit_block"
+    fi
+    if [[ -n "$intro_commit_block" ]]; then
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n\n'
+      fi
+      final_content+="$intro_commit_block"
     fi
     if [[ -n "$final_content" ]]; then
       final_content+=$'\n\n'
