@@ -736,7 +736,7 @@ system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要�
 }
 要求：
 - 只输出中文，summary/suggestion 不要包含 URL 或 Markdown 链接
-- summary/suggestion 不要输出代码或尖括号内容
+- summary/suggestion 可保留字段/函数名，用反引号包裹；不要输出多行代码块或尖括号内容
 - 不要输出 PR 编号或链接
 - 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
 - summary/suggestion 需保留关键背景与影响，可用 1-3 句"""
@@ -812,7 +812,9 @@ if issues and not any(has_zh((i.get("summary") or "") + (i.get("suggestion") or 
     translate_prompt = """你是中文翻译器。把 issues 中的 summary/suggestion 翻译成中文，保持 severity 不变。
 严格输出 JSON，格式：
 {"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要","suggestion":"中文建议"}]}
-不要输出其它文字。"""
+要求：
+- 保留反引号包裹的字段/函数名，不要翻译反引号内的内容
+- 不要输出其它文字。"""
     payload = {
         "model": model,
         "temperature": 0.2,
@@ -1238,15 +1240,22 @@ if [[ -s "$RUN_FILE" ]]; then
           [[ -z "$line" ]] && continue
           commit_block+="- $line"$'\n'
         done <<< "$commit_lines"
+        commit_block="$(printf '%s' "$commit_block" | sed 's/[[:space:]]*$//')"
       fi
     fi
 
     final_content=""
     if [[ -n "$mention_line" ]]; then
-      final_content+="$mention_line"$'\n\n'
+      final_content+="$mention_line"
     fi
     if [[ -n "$commit_block" ]]; then
-      final_content+="$commit_block"$'\n'
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n\n'
+      fi
+      final_content+="$commit_block"
+    fi
+    if [[ -n "$final_content" ]]; then
+      final_content+=$'\n\n'
     fi
     final_content+="【发现】"$'\n'
     final_content+="$content"
