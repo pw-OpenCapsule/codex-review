@@ -809,6 +809,7 @@ text = os.environ.get("REVIEW_TEXT", "")
 if not text.strip():
     raise SystemExit(0)
 
+text = text.replace("\r\n", "\n")
 text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
 text = re.sub(r"(?mi)^To use Codex here,.*$", "", text)
 text = re.sub(
@@ -816,10 +817,14 @@ text = re.sub(
     "",
     text,
 )
-text = re.sub(r"(?mi)^###\\s*💡\\s*Codex Review\\s*$", "", text)
-text = re.sub(r"(?mi)^Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
+text = re.sub(r"(?mi)^\\s*###\\s*💡\\s*Codex Review\\s*$", "", text)
+text = re.sub(r"(?mi)^\\s*Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
+text = re.sub(r"(?mi)^\\s*Useful\\? React with.*$", "", text)
 text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
-text = re.sub(r"(?mi)^CODEX_LOCATION\\t.*$", "", text)
+text = re.sub(r"(?mi)^\\s*CODEX_LOCATION\\b.*$", "", text)
+text = re.sub(r"<\\/?sub>", "", text)
+text = re.sub(r"!\\[(P[0-5])\\]\\([^)]*\\)", r"[\\1]", text)
+text = re.sub(r"!\\[[^\\]]*\\]\\([^)]*\\)", "", text)
 
 def repl(m):
     path = m.group("path")
@@ -832,6 +837,7 @@ text = re.sub(
     text,
 )
 text = re.sub(r"https?://\\S+", "", text)
+text = re.sub(r"\\n{3,}", "\\n\\n", text)
 print(text.strip())
 PY
 }
