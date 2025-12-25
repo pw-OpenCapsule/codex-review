@@ -779,14 +779,64 @@ content = (
 if not content:
     sys.exit(1)
 
-try:
-    parsed = json.loads(content)
-except Exception:
+def extract_json(raw: str):
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```\\w*\\s*", "", raw)
+        raw = re.sub(r"```$", "", raw.strip())
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(raw[start:end+1])
+        except Exception:
+            return None
+    return None
+
+def has_zh(text: str) -> bool:
+    return bool(re.search(r"[\\u4e00-\\u9fff]", text))
+
+parsed = extract_json(content)
+if not parsed:
     sys.exit(1)
 
 issues = parsed.get("issues") or []
 if has_severity and not issues:
     sys.exit(1)
+
+if issues and not any(has_zh((i.get("summary") or "") + (i.get("suggestion") or "")) for i in issues):
+    translate_prompt = """你是中文翻译器。把 issues 中的 summary/suggestion 翻译成中文，保持 severity 不变。
+严格输出 JSON，格式：
+{"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要","suggestion":"中文建议"}]}
+不要输出其它文字。"""
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": 600,
+        "messages": [
+            {"role": "system", "content": translate_prompt},
+            {"role": "user", "content": json.dumps({"issues": issues}, ensure_ascii=False)},
+        ],
+    }
+    req = urllib.request.Request(
+        api,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": token},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        translated = extract_json(
+            (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+        )
+        if translated and translated.get("issues"):
+            issues = translated.get("issues") or issues
+    except Exception:
+        pass
 
 for issue in issues:
     severity = (issue.get("severity") or "").strip().upper()
