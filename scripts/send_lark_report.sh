@@ -13,29 +13,56 @@ ensure_dirs
 
 ensure_gh_auth
 
-DATE_INPUT="${1:-}"
+usage() {
+  cat <<'EOF'
+Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n]
+  REPORT_DATE          指定报告日期（默认今天）
+  --dry, --dry-run, -n  发送到测试 webhook（不写 PR 标记）
+EOF
+}
+
+DATE_INPUT=""
+LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --dry|--dry-run|-n)
+      LARK_DRY_RUN=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$DATE_INPUT" ]]; then
+        DATE_INPUT="$arg"
+      else
+        die "未知参数：$arg"
+      fi
+      ;;
+  esac
+done
+
 REPORT_DATE="${DATE_INPUT:-$(TZ="$TZ" date +%F)}"
 RUN_FILE="$RUN_DIR/run-$REPORT_DATE.tsv"
 TODAY="$(TZ="$TZ" date +%F)"
 TARGET_ENTRY="${RETRY_ONLY:-}"
+SELF_GH_LOGIN="${SELF_GH_LOGIN:-}"
+
+if [[ -z "$SELF_GH_LOGIN" ]]; then
+  SELF_GH_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
+fi
 
 if [[ "$REPORT_DATE" != "$TODAY" && "${LARK_DRY_RUN:-0}" != "1" ]]; then
   log "报告日期非今日，跳过发送：$REPORT_DATE"
   exit 0
 fi
 
-report_marker() {
-  printf 'codex-review-report-sent:%s' "$REPORT_DATE"
-}
-
 report_already_sent() {
   local gh_repo="$1"
   local pr_number="$2"
-  local marker
   local already
 
-  marker="$(report_marker)"
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq "[.comments[].body | contains(\"$marker\")] | any")"
+  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("已发送日报")] | any')"
   [[ "$already" == "true" ]]
 }
 
@@ -73,16 +100,15 @@ post_report_comment() {
   local gh_repo="$1"
   local pr_number="$2"
   local content="$3"
-  local marker
   local normalized
 
-  marker="$(report_marker)"
   normalized="$(normalize_for_pr_comment "$content")"
   if [[ -z "$(printf '%s' "$normalized" | tr -d '[:space:]')" ]]; then
     normalized="审查结果已发送。"
   fi
 
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "<!-- ${marker} -->"$'\n\n'"$normalized" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "$normalized" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "已发送日报" >/dev/null
 }
 
 codex_setup_required() {
@@ -94,6 +120,183 @@ import re
 
 text = os.environ.get("REVIEW_TEXT", "")
 if re.search(r"To use Codex here,", text, flags=re.IGNORECASE):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+review_has_no_issues() {
+  local review_text="$1"
+
+  REVIEW_TEXT="$review_text" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("REVIEW_TEXT", "")
+patterns = [
+    r"didn't find any major issues",
+    r"no major issues",
+    r"no issues found",
+    r"looks good to me",
+]
+for pat in patterns:
+    if re.search(pat, text, flags=re.IGNORECASE):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+fetch_pr_commit_lines() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local limit="${3:-10}"
+  local json
+
+  if [[ -z "$gh_repo" || -z "$pr_number" ]]; then
+    return 1
+  fi
+  if [[ "$limit" -le 0 ]]; then
+    return 1
+  fi
+
+  json="$(gh api "repos/$gh_repo/pulls/$pr_number/commits?per_page=$limit" 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 1
+  fi
+
+  COMMITS_JSON="$json" python3 - <<'PY'
+import json
+import os
+
+raw = os.environ.get("COMMITS_JSON", "")
+if not raw.strip():
+    raise SystemExit(1)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    raise SystemExit(1)
+
+lines = []
+for item in data:
+    sha = (item.get("sha") or "")[:7]
+    commit = item.get("commit") or {}
+    msg = (commit.get("message") or "").splitlines()[0].strip()
+    author = (commit.get("author") or {}).get("name") or ""
+    if not msg:
+        continue
+    if author:
+        lines.append(f"{sha} {author} {msg}")
+    else:
+        lines.append(f"{sha} {msg}")
+
+if not lines:
+    raise SystemExit(1)
+
+print("\n".join(lines))
+PY
+}
+
+get_pr_base_head() {
+  local gh_repo="$1"
+  local pr_number="$2"
+
+  gh pr view --repo "$gh_repo" "$pr_number" --json baseRefOid,headRefOid --jq '"\(.baseRefOid)\t\(.headRefOid)"' 2>/dev/null || true
+}
+
+find_intro_commit() {
+  local repo_path="$1"
+  local base_sha="$2"
+  local head_sha="$3"
+  local file_path="$4"
+
+  if [[ -z "$repo_path" || -z "$base_sha" || -z "$head_sha" || -z "$file_path" ]]; then
+    return 1
+  fi
+
+  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+    git -C "$repo_path" fetch origin >/dev/null 2>&1 || true
+  fi
+
+  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+    return 1
+  fi
+
+  git -C "$repo_path" log --reverse --format='%H%x1f%an%x1f%ae%x1f%s' "${base_sha}..${head_sha}" -- "$file_path" | head -n 1
+}
+
+resolve_lark_webhook() {
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
+      die "LARK_WEBHOOK_URL_DRY 为空"
+    fi
+    printf '%s' "$LARK_WEBHOOK_URL_DRY"
+    return 0
+  fi
+
+  if [[ -z "$LARK_WEBHOOK_URL" ]]; then
+    die "LARK_WEBHOOK_URL 为空"
+  fi
+  printf '%s' "$LARK_WEBHOOK_URL"
+}
+
+gitlab_commit_url() {
+  local gitlab_path="$1"
+  local sha="$2"
+  local proto="${GITLAB_PROTOCOL:-https}"
+  local host="${GITLAB_HOST:-}"
+
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+
+  printf '%s://%s/%s/commit/%s' "$proto" "$host" "$gitlab_path" "$sha"
+}
+
+check_lark_response() {
+  local body="$1"
+
+  RESPONSE_BODY="$body" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("RESPONSE_BODY", "").strip()
+if not raw:
+    sys.exit(0)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+code = data.get("code")
+if code is None:
+    code = data.get("StatusCode")
+
+if code is None:
+    sys.exit(0)
+
+try:
+    code = int(code)
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if code == 0 else 1)
+PY
+}
+
+review_contains_severity() {
+  local review_text="$1"
+
+  REVIEW_TEXT="$review_text" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("REVIEW_TEXT", "")
+if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
+    raise SystemExit(0)
+if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -161,6 +364,14 @@ import re
 import sys
 
 text = os.environ.get("REVIEW_TEXT", "")
+m2 = re.search(r"^CODEX_LOCATION\t([0-9a-fA-F]{7,40})\t([^\t]+)\t(\d+)\t(\d+)$", text, flags=re.M)
+if m2:
+    commit = m2.group(1)
+    path = m2.group(2)
+    start = m2.group(3)
+    end = m2.group(4)
+    print(f"{commit}\t{path}\t{start}\t{end}")
+    sys.exit(0)
 m = re.search(r"https?://github.com/[^\s)]+/blob/([0-9a-fA-F]{7,40})/([^#\s)]+)#L(\d+)(?:-L(\d+))?", text)
 if not m:
     sys.exit(0)
@@ -181,6 +392,7 @@ get_code_snippet() {
   local end="$5"
   local branch="$6"
   local content=""
+  local context="${SNIPPET_CONTEXT:-3}"
 
   if [[ ! -d "$repo_dir/.git" ]]; then
     return 1
@@ -198,6 +410,21 @@ get_code_snippet() {
 
   if [[ -z "$content" ]]; then
     return 1
+  fi
+
+  if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$context" =~ ^[0-9]+$ ]]; then
+      context=0
+    fi
+    local start_num="$start"
+    local end_num="$end"
+    local adj_start=$((start_num - context))
+    local adj_end=$((end_num + context))
+    if (( adj_start < 1 )); then
+      adj_start=1
+    fi
+    printf '%s\n' "$content" | sed -n "${adj_start},${adj_end}p"
+    return 0
   fi
 
   printf '%s\n' "$content" | sed -n "${start},${end}p"
@@ -356,6 +583,34 @@ format_mention_line() {
   printf '责任人: %s' "$joined"
 }
 
+format_single_mention() {
+  local label="$1"
+  local name="$2"
+  local email="$3"
+  local display=""
+  local lark_id=""
+
+  lark_id="$(lookup_lark_id "$email" "$name" || true)"
+  if [[ -n "$lark_id" ]]; then
+    printf '%s: <at id=%s></at>' "$label" "$lark_id"
+    return 0
+  fi
+
+  display="$name"
+  if [[ -z "$display" ]]; then
+    display="$email"
+  fi
+  if [[ -n "$email" && "$email" != "$display" ]]; then
+    display="$display ($email)"
+  fi
+  if [[ -n "$display" ]]; then
+    printf '%s: @%s' "$label" "$display"
+    return 0
+  fi
+
+  return 1
+}
+
 code_lang() {
   local path="$1"
   local ext="${path##*.}"
@@ -396,10 +651,14 @@ get_review_text() {
   local gh_repo="$1"
   local pr_number="$2"
   local pr_json
+  local review_comments_json
 
   pr_json="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments,reviews)"
+  review_comments_json="$(gh api "repos/$gh_repo/pulls/$pr_number/comments" 2>/dev/null || printf '[]')"
 
+  REVIEW_IGNORE_AUTHORS="${REVIEW_IGNORE_AUTHORS:-$SELF_GH_LOGIN}" \
   CODEX_REVIEW_AUTHOR="${CODEX_REVIEW_AUTHOR:-}" CODEX_PROMPT="${CODEX_PROMPT:-}" PR_JSON="$pr_json" \
+  REVIEW_COMMENTS_JSON="$review_comments_json" \
   python3 - <<'PY'
 import json
 import os
@@ -410,8 +669,11 @@ if not raw.strip():
     sys.exit(0)
 
 data = json.loads(raw)
+review_comments = json.loads(os.environ.get("REVIEW_COMMENTS_JSON", "[]") or "[]")
 author = os.environ.get("CODEX_REVIEW_AUTHOR") or ""
 prompt = os.environ.get("CODEX_PROMPT") or ""
+ignore_raw = os.environ.get("REVIEW_IGNORE_AUTHORS") or ""
+ignore = {item.strip().lower() for item in ignore_raw.split(",") if item.strip()}
 
 comments = data.get("comments") or []
 reviews = data.get("reviews") or []
@@ -419,20 +681,31 @@ reviews = data.get("reviews") or []
 def body_text(item):
     return item.get("body") if isinstance(item, dict) else None
 
+def author_login(item):
+    login = (item.get("author") or {}).get("login") if isinstance(item, dict) else ""
+    return (login or "").lower()
+
 texts = []
+location = None
 if author:
     for item in comments:
+        if author_login(item) in ignore:
+            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
                 texts.append(text)
     for item in reviews:
+        if author_login(item) in ignore:
+            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
                 texts.append(text)
 else:
     for item in comments:
+        if author_login(item) in ignore:
+            continue
         text = body_text(item)
         if not text:
             continue
@@ -440,9 +713,28 @@ else:
             continue
         texts.append(text)
     for item in reviews:
+        if author_login(item) in ignore:
+            continue
         text = body_text(item)
         if text:
             texts.append(text)
+
+for item in review_comments or []:
+    login = ((item.get("user") or {}).get("login") or "").lower()
+    if login and login in ignore:
+        continue
+    text = item.get("body")
+    if text:
+        texts.append(text)
+    if location is None:
+        path = item.get("path")
+        line = item.get("line") or item.get("original_line") or item.get("position")
+        commit = item.get("commit_id") or item.get("original_commit_id")
+        if path and line and commit:
+            location = (commit, path, str(line), str(line))
+
+if location:
+    texts.append(f"CODEX_LOCATION\t{location[0]}\t{location[1]}\t{location[2]}\t{location[3]}")
 
 print("\n".join(texts))
 PY
@@ -486,6 +778,9 @@ def normalize(text: str) -> str:
         "",
         text,
     )
+    text = re.sub(r"(?mi)^###\\s*💡\\s*Codex Review\\s*$", "", text)
+    text = re.sub(r"(?mi)^Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
+    text = re.sub(r"(?mi)^CODEX_LOCATION\\t.*$", "", text)
     def repl(m):
         path = m.group("path")
         lines = m.group("lines").replace("L", "")
@@ -495,25 +790,25 @@ def normalize(text: str) -> str:
         repl,
         text,
     )
-    text = text.replace("P0 Badge", "P0").replace("P1 Badge", "P1")
+    text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
     text = re.sub(r"https?://\\S+", "", text)
     return text.strip()
 
 normalized = normalize(review_text)
-has_severity = bool(re.search(r"\\bP[01]\\b", normalized))
+has_severity = bool(re.search(r"\bP[0-5]\b", normalized))
 
 system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要额外文字），格式如下：
 {
   "issues": [
-    {"severity": "P0|P1", "summary": "简短中文概述", "suggestion": "简短中文建议"}
+    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "中文概述", "suggestion": "中文建议"}
   ]
 }
 要求：
 - 只输出中文，summary/suggestion 不要包含 URL 或 Markdown 链接
-- summary/suggestion 不要输出代码或尖括号内容
+- summary/suggestion 可保留字段/函数名，用反引号包裹；不要输出多行代码块或尖括号内容
 - 不要输出 PR 编号或链接
-- 如果原始审查没有明确 P0/P1，则输出 {"issues": []}
-- summary/suggestion 各不超过 50 字"""
+- 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
+- summary/suggestion 需保留关键背景与影响，可用 1-3 句"""
 
 user_prompt = f"仓库: {repo}\n分支: {branch}\n位置: {location or '未知'}\n原始审查内容:\n{normalized}"
 
@@ -553,14 +848,66 @@ content = (
 if not content:
     sys.exit(1)
 
-try:
-    parsed = json.loads(content)
-except Exception:
+def extract_json(raw: str):
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```\\w*\\s*", "", raw)
+        raw = re.sub(r"```$", "", raw.strip())
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(raw[start:end+1])
+        except Exception:
+            return None
+    return None
+
+def has_zh(text: str) -> bool:
+    return bool(re.search(r"[\\u4e00-\\u9fff]", text))
+
+parsed = extract_json(content)
+if not parsed:
     sys.exit(1)
 
 issues = parsed.get("issues") or []
 if has_severity and not issues:
     sys.exit(1)
+
+if issues and not any(has_zh((i.get("summary") or "") + (i.get("suggestion") or "")) for i in issues):
+    translate_prompt = """你是中文翻译器。把 issues 中的 summary/suggestion 翻译成中文，保持 severity 不变。
+严格输出 JSON，格式：
+{"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要","suggestion":"中文建议"}]}
+要求：
+- 保留反引号包裹的字段/函数名，不要翻译反引号内的内容
+- 不要输出其它文字。"""
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": 600,
+        "messages": [
+            {"role": "system", "content": translate_prompt},
+            {"role": "user", "content": json.dumps({"issues": issues}, ensure_ascii=False)},
+        ],
+    }
+    req = urllib.request.Request(
+        api,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": token},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        translated = extract_json(
+            (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+        )
+        if translated and translated.get("issues"):
+            issues = translated.get("issues") or issues
+    except Exception:
+        pass
 
 for issue in issues:
     severity = (issue.get("severity") or "").strip().upper()
@@ -583,6 +930,7 @@ text = os.environ.get("REVIEW_TEXT", "")
 if not text.strip():
     raise SystemExit(0)
 
+text = text.replace("\r\n", "\n")
 text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
 text = re.sub(r"(?mi)^To use Codex here,.*$", "", text)
 text = re.sub(
@@ -590,6 +938,14 @@ text = re.sub(
     "",
     text,
 )
+text = re.sub(r"(?mi)^\s*###\s*💡\s*Codex Review\s*$", "", text)
+text = re.sub(r"(?mi)^\s*Here are some automated review suggestions for this pull request\.?\s*$", "", text)
+text = re.sub(r"(?mi)^\s*Useful\? React with.*$", "", text)
+text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
+text = re.sub(r"(?mi)^\s*CODEX_LOCATION\b.*$", "", text)
+text = re.sub(r"</?sub>", "", text)
+text = re.sub(r"!\[(P[0-5])\]\([^)]*\)", r"[\1]", text)
+text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
 
 def repl(m):
     path = m.group("path")
@@ -597,11 +953,12 @@ def repl(m):
     return f"{path}:{lines}"
 
 text = re.sub(
-    r"https?://github.com/[^\\s)]+/blob/[^/]+/(?P<path>[^#\\s)]+)#(?P<lines>L\\d+(?:-L\\d+)?)",
+    r"https?://github.com/[^\s)]+/blob/[^/]+/(?P<path>[^#\s)]+)#(?P<lines>L\d+(?:-L\d+)?)",
     repl,
     text,
 )
-text = re.sub(r"https?://\\S+", "", text)
+text = re.sub(r"https?://\S+", "", text)
+text = re.sub(r"\n{3,}", "\n\n", text)
 print(text.strip())
 PY
 }
@@ -616,18 +973,18 @@ fallback_summary() {
   local severity=""
   local cleaned=""
 
-  issues="$(printf '%s\n' "$review_text" | grep -E 'P0|P1' | head -n 5 || true)"
+  issues="$(printf '%s\n' "$review_text" | grep -E 'P[0-5]' | head -n 5 || true)"
   if [[ -n "$issues" ]]; then
     first_line="$(printf '%s\n' "$issues" | head -n 1)"
-    if [[ "$first_line" == *P0* ]]; then
-      severity="P0"
+    if [[ "$first_line" =~ (P[0-5]) ]]; then
+      severity="${BASH_REMATCH[1]}"
     else
       severity="P1"
     fi
     cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\\*\\*//g; s/!\\[[^]]*\\]\\([^)]*\\)//g')"
     printf '%s\t%s\t%s\n' "$severity" "$cleaned" ""
   else
-    printf '%s\t%s\t%s\n' "NONE" "无 P0/P1 风险或审查未完成" ""
+    printf '%s\t%s\t%s\n' "NONE" "无 P0-P5 风险或审查未完成" ""
   fi
 }
 
@@ -666,6 +1023,65 @@ build_run_file_from_prs() {
 if [[ ! -s "$RUN_FILE" ]]; then
   build_run_file_from_prs "$REPORT_DATE"
 fi
+
+log_missing_prs() {
+  local missing
+
+  missing="$(
+    RUN_FILE="$RUN_FILE" ROOT_DIR="$ROOT_DIR" DEFAULT_BRANCH="$DEFAULT_BRANCH" \
+    python3 - <<'PY'
+import os
+
+run_file = os.environ["RUN_FILE"]
+root_dir = os.environ["ROOT_DIR"]
+default_branch = os.environ.get("DEFAULT_BRANCH", "main")
+
+entries = set()
+if os.path.exists(run_file):
+    with open(run_file, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            entries.add(f"{parts[0]}@{parts[1]}")
+
+config_path = os.path.join(root_dir, "config", "repos.txt")
+if not os.path.exists(config_path):
+    raise SystemExit(0)
+
+missing = []
+with open(config_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "@" in line:
+            path, branch = line.split("@", 1)
+            branch = branch.strip() or default_branch
+        else:
+            path = line.strip()
+            branch = default_branch
+        key = f"{path}@{branch}"
+        if key not in entries:
+            missing.append(key)
+
+for item in missing:
+    print(item)
+PY
+  )"
+
+  if [[ -n "$missing" ]]; then
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      log "未找到 PR，跳过：$item"
+    done <<< "$missing"
+  fi
+}
+
+log_missing_prs
 
 build_payload() {
   local title="$1"
@@ -786,9 +1202,11 @@ if [[ -s "$RUN_FILE" ]]; then
       fi
     fi
 
-    if report_already_sent "$gh_repo" "$pr_number"; then
-      log "已发送日报，跳过：$gitlab_path@$branch"
-      continue
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      if report_already_sent "$gh_repo" "$pr_number"; then
+        log "已发送日报，跳过：$gitlab_path@$branch"
+        continue
+      fi
     fi
 
     review_text="$(get_review_text "$gh_repo" "$pr_number")"
@@ -805,11 +1223,25 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
+    if review_has_no_issues "$review_text"; then
+      log "审查无风险项，跳过发送：$gitlab_path@$branch"
+      continue
+    fi
+
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      if ! review_contains_severity "$review_text"; then
+        log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
+        continue
+      fi
+    fi
+
     location_info="$(extract_location "$review_text")"
     location=""
     snippet=""
     path=""
     mention_line=""
+    intro_line=""
+    intro_commit_block=""
     if [[ -n "$location_info" ]]; then
       read -r commit path start end <<< "$location_info"
       location="${path}:${start}-${end}"
@@ -819,6 +1251,33 @@ if [[ -s "$RUN_FILE" ]]; then
       if [[ -n "$authors_tsv" ]]; then
         mention_line="$(format_mention_line "$authors_tsv" || true)"
       fi
+
+      if [[ -n "$repo_path" && -n "$path" ]]; then
+        if pr_range="$(get_pr_base_head "$gh_repo" "$pr_number")"; then
+          read -r pr_base pr_head <<< "$pr_range"
+          intro_commit="$(find_intro_commit "$repo_path" "$pr_base" "$pr_head" "$path" || true)"
+          if [[ -n "$intro_commit" ]]; then
+            IFS=$'\x1f' read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
+            intro_desc="${intro_sha:0:7}"
+            if [[ -n "$intro_name" ]]; then
+              intro_desc+=" $intro_name"
+            fi
+            if [[ -n "$intro_subject" ]]; then
+              intro_desc+=" $intro_subject"
+            fi
+            intro_url="$(gitlab_commit_url "$gitlab_path" "$intro_sha" || true)"
+            if [[ -n "$intro_url" ]]; then
+              intro_commit_block="【引入提交】"$'\n\n'"• [${intro_sha:0:7}]($intro_url)"
+              if [[ -n "$intro_name" || -n "$intro_subject" ]]; then
+                intro_commit_block+=" $intro_name $intro_subject"
+              fi
+            else
+              intro_commit_block="【引入提交】"$'\n\n'"• $intro_desc"
+            fi
+            intro_line="$(format_single_mention "引入人" "$intro_name" "$intro_email" || true)"
+          fi
+        fi
+      fi
     fi
 
     content=""
@@ -827,18 +1286,20 @@ if [[ -s "$RUN_FILE" ]]; then
       if [[ -n "$summary_lines" ]]; then
         while IFS=$'\t' read -r severity summary suggestion; do
           [[ -z "$severity" || "$severity" == "NONE" ]] && continue
-          if [[ "$severity" == "P0" ]]; then
-            if [[ "$use_rich_tags" -eq 1 ]]; then
-              line="- <text_tag color='red'>P0</text_tag> $summary"
-            else
-              line="- [P0] $summary"
-            fi
+          color="orange"
+          label="$severity"
+          case "$severity" in
+            P0) color="red" ;;
+            P1) color="orange" ;;
+            P2) color="yellow" ;;
+            P3) color="blue" ;;
+            P4) color="green" ;;
+            P5) color="neutral" ;;
+          esac
+          if [[ "$use_rich_tags" -eq 1 ]]; then
+            line="- <text_tag color='$color'>$label</text_tag> $summary"
           else
-            if [[ "$use_rich_tags" -eq 1 ]]; then
-              line="- <text_tag color='orange'>P1</text_tag> $summary"
-            else
-              line="- [P1] $summary"
-            fi
+            line="- [$label] $summary"
           fi
           if [[ -n "$location" || -n "$suggestion" ]]; then
             line+="（"
@@ -867,45 +1328,102 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
-    if [[ -n "$mention_line" ]]; then
-      content="$mention_line"$'\n\n'"$content"
+    commit_block=""
+    commit_limit="${COMMIT_LOG_LIMIT:-10}"
+    if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
+      commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
+      if [[ -n "$commit_lines" ]]; then
+        commit_block="【提交】"$'\n\n'
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          commit_block+="• $line"$'\n'
+        done <<< "$commit_lines"
+        commit_block="$(printf '%s' "$commit_block" | sed 's/[[:space:]]*$//')"
+      fi
     fi
+
+    final_content=""
+    if [[ -n "$mention_line" ]]; then
+      final_content+="$mention_line"
+    fi
+    if [[ -n "$intro_line" ]]; then
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n'
+      fi
+      final_content+="$intro_line"
+    fi
+    if [[ -n "$commit_block" ]]; then
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n\n'
+      fi
+      final_content+="$commit_block"
+    fi
+    if [[ -n "$intro_commit_block" ]]; then
+      if [[ -n "$final_content" ]]; then
+        final_content+=$'\n\n'
+      fi
+      final_content+="$intro_commit_block"
+    fi
+    if [[ -n "$final_content" ]]; then
+      final_content+=$'\n<br>\n<br>\n'
+    fi
+    final_content+="【发现】"$'\n\n'
+    final_content+="$content"
 
     if [[ -n "$snippet" ]]; then
       lang="$(code_lang "$path")"
-      content+=$'\n'"**代码片段：**"$'\n'
-      content+='```'"$lang"$'\n'
-      content+="$snippet"$'\n'
-      content+='```'$'\n'
+      final_content+=$'\n'"**代码片段：**"$'\n'
+      final_content+='```'"$lang"$'\n'
+      final_content+="$snippet"$'\n'
+      final_content+='```'$'\n'
     fi
 
     title="每日代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
-    payload="$(build_payload "$title" "$content")"
+    payload="$(build_payload "$title" "$final_content")"
 
     repo_slug="${gitlab_path//\//_}-${branch//\//-}"
     REPORT_TEXT_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.txt"
     REPORT_PAYLOAD_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.json"
-    printf '%s' "$content" > "$REPORT_TEXT_FILE"
+    printf '%s' "$final_content" > "$REPORT_TEXT_FILE"
     printf '%s' "$payload" > "$REPORT_PAYLOAD_FILE"
 
     if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
       log "DRY_RUN=1，已生成报告：$REPORT_TEXT_FILE"
       log "DRY_RUN=1，已生成 payload：$REPORT_PAYLOAD_FILE"
       cat "$REPORT_TEXT_FILE"
-      sent_any=1
-      continue
     fi
 
-    if [[ -z "$LARK_WEBHOOK_URL" ]]; then
-      die "LARK_WEBHOOK_URL 为空"
+    webhook_url="$(resolve_lark_webhook)"
+    if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+      log "DRY_RUN=1，使用测试 webhook 发送"
     fi
 
-    http_code="$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' -d "$payload" "$LARK_WEBHOOK_URL")"
+    response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$webhook_url")"
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
     if [[ "$http_code" != "200" ]]; then
       log "Lark 发送失败（HTTP $http_code），跳过标记：$gitlab_path@$branch"
+      if [[ -n "$body" ]]; then
+        log "Lark 响应: $body"
+      fi
       continue
     fi
-    post_report_comment "$gh_repo" "$pr_number" "$content"
+
+    if ! check_lark_response "$body"; then
+      log "Lark 返回错误，跳过标记：$gitlab_path@$branch"
+      if [[ -n "$body" ]]; then
+        log "Lark 响应: $body"
+      fi
+      continue
+    fi
+
+    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+      post_report_comment "$gh_repo" "$pr_number" "$final_content"
+      log "已发送日报：$gitlab_path@$branch"
+    else
+      log "DRY_RUN=1，已发送测试日报：$gitlab_path@$branch"
+    fi
     sent_any=1
   done < "$RUN_FILE"
 fi
