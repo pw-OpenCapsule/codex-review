@@ -1144,7 +1144,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
       commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
       if [[ -n "$commit_lines" ]]; then
-        commit_block="**提交：**"$'\n'
+        commit_block="【提交】"$'\n'
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
           commit_block+="- $line"$'\n'
@@ -1159,6 +1159,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ -n "$commit_block" ]]; then
       final_content+="$commit_block"$'\n'
     fi
+    final_content+="【发现】"$'\n'
     final_content+="$content"
 
     if [[ -n "$snippet" ]]; then
