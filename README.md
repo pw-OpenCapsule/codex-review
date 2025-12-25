@@ -17,8 +17,9 @@ AI 代码审计（每日）
 1) 编辑 config/settings.env
 2) 编辑 config/repos.txt（支持分支）
 3) （可选）首次运行 scripts/init_repos.sh（仅建仓与同步，不创建 PR / 评论）
-4) 运行 scripts/daily_review.sh
-5) 运行 scripts/send_lark_report.sh
+4) （可选）运行 scripts/sync_gogs_repos.sh（从 Gogs 同步仓库列表）
+5) 运行 scripts/daily_review.sh
+6) 运行 scripts/send_lark_report.sh
 
 定时任务示例（东京，08:00）
 0 8 * * * /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
@@ -43,6 +44,7 @@ AI 代码审计（每日）
 - CODEX_SUMMARY_MODEL：摘要模型（默认 gpt-4o-mini）
 - LARK_USER_MAP：Git 与 Lark 用户映射表（默认 config/lark_user_map.tsv）
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
+- SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
 
 拉取请求（PR）状态机（每日）
 - 若自上次审计后无变更，跳过。
@@ -78,6 +80,7 @@ AI 代码审计（每日）
 - config/lark_user_map.tsv：Git 与 Lark 用户映射表
 - scripts/daily_review.sh：创建每日拉取请求并触发 Codex 审查
 - scripts/init_repos.sh：首次建仓与同步（不创建 PR / 评论）
+- scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 config/repos.txt
 - scripts/send_lark_report.sh：发送 Lark 报告
 - templates/AGENTS.md：放在每个镜像仓库根目录
 
