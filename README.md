@@ -44,6 +44,7 @@ AI 代码审计（每日）
 - CODEX_SUMMARY_MODEL：摘要模型（默认 gpt-4o-mini）
 - LARK_USER_MAP：Git 与 Lark 用户映射表（默认 config/lark_user_map.tsv）
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
+- SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
 
 拉取请求（PR）状态机（每日）
 - 若自上次审计后无变更，跳过。
