@@ -52,6 +52,8 @@ RUN_SENT_FILE="$RUN_DIR/run-$TODAY.sent"
 REVIEW_RANGE="${REVIEW_RANGE:-yesterday}"
 LOG_YESTERDAY_COMMITS="${LOG_YESTERDAY_COMMITS:-1}"
 YESTERDAY_LOG_LIMIT="${YESTERDAY_LOG_LIMIT:-20}"
+RANGE_START_DATE=""
+RANGE_END_DATE=""
 
 : > "$RUN_FILE_TMP"
 : > "$QUEUE_FILE"
@@ -60,6 +62,13 @@ ensure_gh_auth
 
 if (( DRY_RUN )); then
   log "DRY RUN: 仅模拟执行，不创建 PR/评论"
+fi
+
+if [[ "$REVIEW_RANGE" == "yesterday" || "$REVIEW_RANGE" == "workday" ]]; then
+  if ! range_output="$(resolve_date_range)"; then
+    exit 0
+  fi
+  read -r RANGE_START_DATE RANGE_END_DATE <<< "$range_output"
 fi
 
 resolve_initial_base() {
@@ -173,6 +182,48 @@ yesterday_date() {
   fi
 }
 
+date_days_ago() {
+  local days="$1"
+
+  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "$days day ago" +%F
+  else
+    TZ="$TZ" date -v-"${days}"d +%F
+  fi
+}
+
+resolve_date_range() {
+  local start_date=""
+  local end_date=""
+  local dow=""
+
+  case "$REVIEW_RANGE" in
+    yesterday)
+      start_date="$(yesterday_date)"
+      end_date="$start_date"
+      ;;
+    workday)
+      dow="$(TZ="$TZ" date +%u)"
+      if [[ "$dow" -ge 6 ]]; then
+        log "周末跳过审计"
+        return 1
+      fi
+      if [[ "$dow" -eq 1 ]]; then
+        start_date="$(date_days_ago 3)"
+        end_date="$(date_days_ago 1)"
+      else
+        start_date="$(date_days_ago 1)"
+        end_date="$start_date"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  printf '%s\t%s\n' "$start_date" "$end_date"
+}
+
 yesterday_base_sha() {
   local dir="$1"
   local head_sha="$2"
@@ -192,18 +243,18 @@ yesterday_base_sha() {
   return 1
 }
 
-yesterday_range_shas() {
+range_shas_for_dates() {
   local dir="$1"
   local ref="$2"
-  local yesterday
+  local start_date="$3"
+  local end_date="$4"
   local start_ts
   local end_ts
   local head_sha
   local base_sha
 
-  yesterday="$(yesterday_date)"
-  start_ts="${yesterday} 00:00:00"
-  end_ts="${yesterday} 23:59:59"
+  start_ts="${start_date} 00:00:00"
+  end_ts="${end_date} 23:59:59"
 
   head_sha="$(git -C "$dir" rev-list -n 1 --before="$end_ts" "$ref" 2>/dev/null || true)"
   if [[ -z "$head_sha" ]]; then
@@ -242,6 +293,42 @@ log_yesterday_commits() {
   fi
 
   log "昨日提交（$count 条，展示前 $limit 条）"
+  log_lines="$(git -C "$dir" log --since="$start_ts" --until="$end_ts" --pretty=format:'%h %an %s' "$ref" | head -n "$limit")"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    log "  - $line"
+  done <<< "$log_lines"
+
+  if (( count > limit )); then
+    log "  - ... 还有 $((count - limit)) 条"
+  fi
+}
+
+log_range_commits() {
+  local dir="$1"
+  local ref="$2"
+  local limit="$3"
+  local start_date="$4"
+  local end_date="$5"
+  local label="$6"
+  local start_ts
+  local end_ts
+  local count
+  local log_lines
+
+  if (( limit <= 0 )); then
+    return 0
+  fi
+
+  start_ts="${start_date} 00:00:00"
+  end_ts="${end_date} 23:59:59"
+
+  count="$(git -C "$dir" rev-list --count --since="$start_ts" --until="$end_ts" "$ref" 2>/dev/null || printf '0')"
+  if (( count <= 0 )); then
+    return 1
+  fi
+
+  log "$label（$count 条，展示前 $limit 条）"
   log_lines="$(git -C "$dir" log --since="$start_ts" --until="$end_ts" --pretty=format:'%h %an %s' "$ref" | head -n "$limit")"
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -350,11 +437,15 @@ collect_queue() {
       else
         base_sha="$(resolve_initial_base "$dir" "$head_sha" "$initial_ref")"
       fi
-    elif [[ "$REVIEW_RANGE" == "yesterday" ]]; then
-      if read -r base_sha head_sha < <(yesterday_range_shas "$dir" "$tracking_ref"); then
+    elif [[ "$REVIEW_RANGE" == "yesterday" || "$REVIEW_RANGE" == "workday" ]]; then
+      if read -r base_sha head_sha < <(range_shas_for_dates "$dir" "$tracking_ref" "$RANGE_START_DATE" "$RANGE_END_DATE"); then
         :
       else
-        log "$gitlab_path@$branch 昨日无提交"
+        if [[ "$REVIEW_RANGE" == "workday" ]]; then
+          log "$gitlab_path@$branch 工作日无提交"
+        else
+          log "$gitlab_path@$branch 昨日无提交"
+        fi
         continue
       fi
     elif [[ -f "$(state_file "$gitlab_path" "$branch")" ]]; then
@@ -371,13 +462,20 @@ collect_queue() {
       fi
     fi
 
-    if [[ "$REVIEW_RANGE" == "yesterday" && "$LOG_YESTERDAY_COMMITS" == "1" ]]; then
-      log_yesterday_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" || true
+    if [[ "$LOG_YESTERDAY_COMMITS" == "1" ]]; then
+      if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+        log_yesterday_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" || true
+      elif [[ "$REVIEW_RANGE" == "workday" ]]; then
+        log_range_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" "$RANGE_START_DATE" "$RANGE_END_DATE" \
+          "工作日提交 (${RANGE_START_DATE}~${RANGE_END_DATE})" || true
+      fi
     fi
 
     if [[ "$base_sha" == "$head_sha" ]]; then
       if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
         log "$gitlab_path@$branch 昨日无变更"
+      elif [[ "$REVIEW_RANGE" == "workday" ]]; then
+        log "$gitlab_path@$branch 工作日无变更"
       else
         log "$gitlab_path@$branch 无变更"
       fi

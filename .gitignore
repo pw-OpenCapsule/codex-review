@@ -2,3 +2,6 @@
 /state/
 /run/
 .env
+.DS_Store
+.runtime/
+repos.txt.back
