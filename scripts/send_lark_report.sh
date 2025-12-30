@@ -197,6 +197,51 @@ print("\n".join(lines))
 PY
 }
 
+fetch_pr_authors_tsv() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local lines
+
+  if [[ -z "$gh_repo" || -z "$pr_number" ]]; then
+    return 1
+  fi
+
+  lines="$(gh api --paginate "repos/$gh_repo/pulls/$pr_number/commits?per_page=100" \
+    --jq '.[] | [.commit.author.name, .commit.author.email] | @tsv' 2>/dev/null || true)"
+  if [[ -z "$lines" ]]; then
+    return 1
+  fi
+
+  AUTHOR_LINES="$lines" python3 - <<'PY'
+import os
+from collections import Counter
+
+raw = os.environ.get("AUTHOR_LINES", "")
+if not raw.strip():
+    raise SystemExit(1)
+
+counts = Counter()
+meta = {}
+for line in raw.splitlines():
+    parts = line.split("\t")
+    name = parts[0].strip() if parts else ""
+    email = parts[1].strip() if len(parts) > 1 else ""
+    key = (email or name).strip().lower()
+    if not key:
+        continue
+    counts[key] += 1
+    if key not in meta:
+        meta[key] = (name, email)
+
+if not counts:
+    raise SystemExit(1)
+
+for key, count in counts.most_common():
+    name, email = meta.get(key, ("", ""))
+    print(f"{name}\t{email}\t{count}")
+PY
+}
+
 get_pr_base_head() {
   local gh_repo="$1"
   local pr_number="$2"
@@ -540,6 +585,7 @@ PY
 
 format_mention_line() {
   local authors_tsv="$1"
+  local label="${2:-责任人}"
   local max_mentions="${LARK_MENTION_MAX:-3}"
   local mentions=()
   local count=0
@@ -580,7 +626,7 @@ format_mention_line() {
       joined="$joined, $mention"
     fi
   done
-  printf '责任人: %s' "$joined"
+  printf '%s: %s' "$label" "$joined"
 }
 
 format_single_mention() {
@@ -1328,18 +1374,10 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
-    commit_block=""
-    commit_limit="${COMMIT_LOG_LIMIT:-10}"
-    if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
-      commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
-      if [[ -n "$commit_lines" ]]; then
-        commit_block="**本次提交**"$'\n'
-        while IFS= read -r line; do
-          [[ -z "$line" ]] && continue
-          commit_block+="• $line"$'\n'
-        done <<< "$commit_lines"
-        commit_block="$(printf '%s' "$commit_block" | sed 's/[[:space:]]*$//')"
-      fi
+    author_block=""
+    authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
+    if [[ -n "$authors_tsv" ]]; then
+      author_block="$(format_mention_line "$authors_tsv" "变更人" || true)"
     fi
 
     final_content=""
@@ -1352,11 +1390,11 @@ if [[ -s "$RUN_FILE" ]]; then
       fi
       final_content+="$intro_line"
     fi
-    if [[ -n "$commit_block" ]]; then
+    if [[ -n "$author_block" ]]; then
       if [[ -n "$final_content" ]]; then
         final_content+=$'\n\n'
       fi
-      final_content+="$commit_block"
+      final_content+="$author_block"
     fi
     if [[ -n "$intro_commit_block" ]]; then
       if [[ -n "$final_content" ]]; then
