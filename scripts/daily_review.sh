@@ -64,6 +64,56 @@ if (( DRY_RUN )); then
   log "DRY RUN: 仅模拟执行，不创建 PR/评论"
 fi
 
+yesterday_date() {
+  if TZ="$TZ" date -d "yesterday" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "yesterday" +%F
+  else
+    TZ="$TZ" date -v-1d +%F
+  fi
+}
+
+date_days_ago() {
+  local days="$1"
+
+  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "$days day ago" +%F
+  else
+    TZ="$TZ" date -v-"${days}"d +%F
+  fi
+}
+
+resolve_date_range() {
+  local start_date=""
+  local end_date=""
+  local dow=""
+
+  case "$REVIEW_RANGE" in
+    yesterday)
+      start_date="$(yesterday_date)"
+      end_date="$start_date"
+      ;;
+    workday)
+      dow="$(TZ="$TZ" date +%u)"
+      if [[ "$dow" -ge 6 ]]; then
+        log "周末跳过审计"
+        return 1
+      fi
+      if [[ "$dow" -eq 1 ]]; then
+        start_date="$(date_days_ago 3)"
+        end_date="$(date_days_ago 1)"
+      else
+        start_date="$(date_days_ago 1)"
+        end_date="$start_date"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  printf '%s\t%s\n' "$start_date" "$end_date"
+}
+
 if [[ "$REVIEW_RANGE" == "yesterday" || "$REVIEW_RANGE" == "workday" ]]; then
   if ! range_output="$(resolve_date_range)"; then
     exit 0
@@ -174,56 +224,6 @@ prepare_repo() {
   printf '%s' "$dir"
 }
 
-yesterday_date() {
-  if TZ="$TZ" date -d "yesterday" +%F >/dev/null 2>&1; then
-    TZ="$TZ" date -d "yesterday" +%F
-  else
-    TZ="$TZ" date -v-1d +%F
-  fi
-}
-
-date_days_ago() {
-  local days="$1"
-
-  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
-    TZ="$TZ" date -d "$days day ago" +%F
-  else
-    TZ="$TZ" date -v-"${days}"d +%F
-  fi
-}
-
-resolve_date_range() {
-  local start_date=""
-  local end_date=""
-  local dow=""
-
-  case "$REVIEW_RANGE" in
-    yesterday)
-      start_date="$(yesterday_date)"
-      end_date="$start_date"
-      ;;
-    workday)
-      dow="$(TZ="$TZ" date +%u)"
-      if [[ "$dow" -ge 6 ]]; then
-        log "周末跳过审计"
-        return 1
-      fi
-      if [[ "$dow" -eq 1 ]]; then
-        start_date="$(date_days_ago 3)"
-        end_date="$(date_days_ago 1)"
-      else
-        start_date="$(date_days_ago 1)"
-        end_date="$start_date"
-      fi
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-
-  printf '%s\t%s\n' "$start_date" "$end_date"
-}
-
 yesterday_base_sha() {
   local dir="$1"
   local head_sha="$2"
@@ -328,7 +328,7 @@ log_range_commits() {
     return 1
   fi
 
-  log "$label（$count 条，展示前 $limit 条）"
+  log "${label}（${count} 条，展示前 ${limit} 条）"
   log_lines="$(git -C "$dir" log --since="$start_ts" --until="$end_ts" --pretty=format:'%h %an %s' "$ref" | head -n "$limit")"
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -520,8 +520,8 @@ create_or_find_pr() {
     --repo "$gh_repo" \
     --base "$base_branch" \
     --head "$head_branch" \
-    --title "【每日审计】$TODAY ($branch)" \
-    --body "每日审计差异：${base_sha} -> ${head_sha}，分支：${branch}。" \
+    --title "【每周审计】$TODAY ($branch)" \
+    --body "每周审计差异：${base_sha} -> ${head_sha}，分支：${branch}。" \
     >/dev/null
 
   pr_number="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state open --json number --jq '.[0].number // empty')"

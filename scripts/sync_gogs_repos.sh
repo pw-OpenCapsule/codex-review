@@ -287,4 +287,4 @@ with open(output_path, "w", encoding="utf-8") as fh:
 PY
 
 rm -f "$tmp_file"
-log "已写入 $output_path（${write_mode}）"
+log "已写入 ${output_path}（${write_mode}）"

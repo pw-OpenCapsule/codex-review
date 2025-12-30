@@ -62,7 +62,7 @@ report_already_sent() {
   local pr_number="$2"
   local already
 
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("已发送日报")] | any')"
+  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("已发送周报")] | any')"
   [[ "$already" == "true" ]]
 }
 
@@ -108,7 +108,7 @@ post_report_comment() {
   fi
 
   gh pr comment --repo "$gh_repo" "$pr_number" --body "$normalized" >/dev/null
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "已发送日报" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "已发送周报" >/dev/null
 }
 
 codex_setup_required() {
@@ -1204,7 +1204,7 @@ if [[ -s "$RUN_FILE" ]]; then
 
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
       if report_already_sent "$gh_repo" "$pr_number"; then
-        log "已发送日报，跳过：$gitlab_path@$branch"
+        log "已发送周报，跳过：$gitlab_path@$branch"
         continue
       fi
     fi
@@ -1333,7 +1333,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if [[ "$commit_limit" =~ ^[0-9]+$ && "$commit_limit" -gt 0 ]]; then
       commit_lines="$(fetch_pr_commit_lines "$gh_repo" "$pr_number" "$commit_limit" || true)"
       if [[ -n "$commit_lines" ]]; then
-        commit_block="【提交】"$'\n\n'
+        commit_block="**本次提交**"$'\n'
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
           commit_block+="• $line"$'\n'
@@ -1378,7 +1378,7 @@ if [[ -s "$RUN_FILE" ]]; then
       final_content+='```'$'\n'
     fi
 
-    title="每日代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
+    title="每周代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
     payload="$(build_payload "$title" "$final_content")"
 
     repo_slug="${gitlab_path//\//_}-${branch//\//-}"
@@ -1403,7 +1403,7 @@ if [[ -s "$RUN_FILE" ]]; then
     body="${response%$'\n'*}"
 
     if [[ "$http_code" != "200" ]]; then
-      log "Lark 发送失败（HTTP $http_code），跳过标记：$gitlab_path@$branch"
+      log "Lark 发送失败（HTTP ${http_code}），跳过标记：${gitlab_path}@${branch}"
       if [[ -n "$body" ]]; then
         log "Lark 响应: $body"
       fi
@@ -1420,9 +1420,9 @@ if [[ -s "$RUN_FILE" ]]; then
 
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
       post_report_comment "$gh_repo" "$pr_number" "$final_content"
-      log "已发送日报：$gitlab_path@$branch"
+      log "已发送周报：$gitlab_path@$branch"
     else
-      log "DRY_RUN=1，已发送测试日报：$gitlab_path@$branch"
+      log "DRY_RUN=1，已发送测试周报：$gitlab_path@$branch"
     fi
     sent_any=1
   done < "$RUN_FILE"
