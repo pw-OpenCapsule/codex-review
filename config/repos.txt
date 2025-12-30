@@ -1,5 +1,19 @@
 # 每行一个 GitLab 仓路径（group/project@branch）。
 # 分支可选，不写则使用 DEFAULT_BRANCH。
 # GitHub 镜像仓名根据 settings.env 的命名规则生成。
-platform/auth-service@main
-platform/payment-core@release
+# platform/auth-service@main
+# platform/payment-core@release
+pp/puregame365@develop
+ka-cn/super-room-admin@dev
+game/operations-admin@dev
+game/scene-admin@master
+pw.seeky/wininfuture-service@dev
+fyd/event-service@card_pay_dev_0.0.1
+fyd/pw-admin@card_pay_dev_0.0.1
+pp/zego-voice-room@test
+#pwtk/pwtk-admin-web@dev
+#pwtk/pwtk-super-admin-web@dev
+pwtk/pwtk-admin-web-submodule@master
+tg/tg-live-game-web@dev
+game/game-platform@dev
+game/guess-admin@dev
