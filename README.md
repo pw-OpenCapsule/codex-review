@@ -1,6 +1,6 @@
-AI 代码审计（每日）
+AI 代码审计（每周）
 
-本仓库包含脚本与配置，用于对 GitHub 镜像仓库执行每日 Codex Code Review usage
+本仓库包含脚本与配置，用于对 GitHub 镜像仓库执行每周 Codex Code Review usage
 （官方用量口径），并发送 Lark 报告。
 
 命名规则
@@ -21,15 +21,15 @@ AI 代码审计（每日）
 5) 运行 scripts/daily_review.sh
 6) 运行 scripts/send_lark_report.sh
 
-定时任务示例（东京，08:00）
-0 8 * * * /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
+定时任务示例（东京，每周一 08:00）
+0 8 * * 1 /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
 
 无人值守建议
 - GitHub：设置 GH_TOKEN 或 GITHUB_TOKEN（Bot Token），确保 gh 与 git 均可无交互使用
 - GitLab：配置 GITLAB_AUTH="user:token" 避免交互登录
 
 手动重跑（可选）
-- FORCE_REVIEW=1：忽略上次基线，重新生成今日 PR 差异
+- FORCE_REVIEW=1：忽略上次基线，重新生成本次 PR 差异
 - FORCE_COMMENT=1：即使已有 @codex review，也会追加一条触发评论
 
 自动发送报告（可选）
@@ -46,10 +46,10 @@ AI 代码审计（每日）
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
 - SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
 
-拉取请求（PR）状态机（每日）
+拉取请求（PR）状态机（每周）
 - 若自上次审计后无变更，跳过。
-- 若今日拉取请求已存在，复用。
-- 若今日拉取请求已存在但已关闭，跳过并推进基线。
+- 若本次拉取请求已存在，复用。
+- 若本次拉取请求已存在但已关闭，跳过并推进基线。
 - 每个拉取请求仅触发一次 @codex review。
 
 风险评分与排序
@@ -63,7 +63,7 @@ AI 代码审计（每日）
 - AUTO_SEND_LARK, REVIEW_WAIT_SECONDS, REVIEW_POLL_INTERVAL, CODEX_REVIEW_AUTHOR
 - CODEX_SUMMARY_API, CODEX_SUMMARY_TOKEN, CODEX_SUMMARY_MODEL
 - LARK_MESSAGE_TYPE（post 或 interactive）
-- REVIEW_RANGE（yesterday 或 incremental，默认 yesterday）
+- REVIEW_RANGE（yesterday 或 incremental，默认 yesterday；周更建议 incremental）
 - LOG_YESTERDAY_COMMITS（默认 1，打印昨日提交摘要）
 - YESTERDAY_LOG_LIMIT（默认 20，最多打印多少条）
 - WORKDIR, STATE_DIR, RUN_DIR
@@ -78,7 +78,7 @@ AI 代码审计（每日）
 - config/settings.env：运行配置
 - config/repos.txt：GitLab 仓白名单（支持分支）
 - config/lark_user_map.tsv：Git 与 Lark 用户映射表
-- scripts/daily_review.sh：创建每日拉取请求并触发 Codex 审查
+- scripts/daily_review.sh：创建每周拉取请求并触发 Codex 审查
 - scripts/init_repos.sh：首次建仓与同步（不创建 PR / 评论）
 - scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 config/repos.txt
 - scripts/send_lark_report.sh：发送 Lark 报告
