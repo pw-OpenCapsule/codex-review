@@ -931,15 +931,15 @@ has_severity = bool(re.search(r"\bP[0-5]\b", normalized))
 system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要额外文字），格式如下：
 {
   "issues": [
-    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "中文概述", "suggestion": "中文建议"}
+    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "中文概述"}
   ]
 }
 要求：
-- 只输出中文，summary/suggestion 不要包含 URL 或 Markdown 链接
-- summary/suggestion 可保留字段/函数名，用反引号包裹；不要输出多行代码块或尖括号内容
+- 只输出中文，summary 不要包含 URL 或 Markdown 链接
+- summary 可保留字段/函数名，用反引号包裹；不要输出多行代码块或尖括号内容
 - 不要输出 PR 编号或链接
 - 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
-- summary/suggestion 需保留关键背景与影响，可用 1-3 句"""
+- summary 需保留关键背景与影响，可用 1-3 句"""
 
 user_prompt = f"仓库: {repo}\n分支: {branch}\n位置: {location or '未知'}\n原始审查内容:\n{normalized}"
 
@@ -1008,10 +1008,10 @@ issues = parsed.get("issues") or []
 if has_severity and not issues:
     sys.exit(1)
 
-if issues and not any(has_zh((i.get("summary") or "") + (i.get("suggestion") or "")) for i in issues):
-    translate_prompt = """你是中文翻译器。把 issues 中的 summary/suggestion 翻译成中文，保持 severity 不变。
+if issues and not any(has_zh((i.get("summary") or "")) for i in issues):
+    translate_prompt = """你是中文翻译器。把 issues 中的 summary 翻译成中文，保持 severity 不变。
 严格输出 JSON，格式：
-{"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要","suggestion":"中文建议"}]}
+{"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要"}]}
 要求：
 - 保留反引号包裹的字段/函数名，不要翻译反引号内的内容
 - 不要输出其它文字。"""
@@ -1043,10 +1043,9 @@ if issues and not any(has_zh((i.get("summary") or "") + (i.get("suggestion") or 
 for issue in issues:
     severity = (issue.get("severity") or "").strip().upper()
     summary = (issue.get("summary") or "").strip()
-    suggestion = (issue.get("suggestion") or "").strip()
     if not severity or not summary:
         continue
-    print(f"{severity}\t{summary}\t{suggestion}")
+    print(f"{severity}\t{summary}")
 PY
 }
 
@@ -1454,7 +1453,7 @@ if [[ -s "$RUN_FILE" ]]; then
     if summary_lines="$(summarize_review_with_ai "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
       if [[ -n "$summary_lines" ]]; then
         snippet_index=0
-        while IFS=$'\t' read -r severity summary suggestion; do
+        while IFS=$'\t' read -r severity summary; do
           [[ -z "$severity" || "$severity" == "NONE" ]] && continue
           entry_location=""
           entry_snippet=""
@@ -1490,16 +1489,10 @@ if [[ -s "$RUN_FILE" ]]; then
           elif [[ "${#issue_entries[@]}" -eq 0 ]]; then
             line_location="$location"
           fi
-          if [[ -n "$line_location" || -n "$suggestion" ]]; then
+          if [[ -n "$line_location" ]]; then
             line+="（"
             if [[ -n "$line_location" ]]; then
               line+="位置: $line_location"
-            fi
-            if [[ -n "$suggestion" ]]; then
-              if [[ -n "$line_location" ]]; then
-                line+="，"
-              fi
-              line+="建议: $suggestion"
             fi
             line+="）"
           fi
