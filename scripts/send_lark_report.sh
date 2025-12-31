@@ -125,6 +125,32 @@ raise SystemExit(1)
 PY
 }
 
+codex_usage_limited() {
+  local review_text="$1"
+
+  REVIEW_TEXT="$review_text" python3 - <<'PY'
+import os
+import re
+
+text = os.environ.get("REVIEW_TEXT", "")
+patterns = [
+    r"codex usage limits have been reached",
+    r"usage limits have been reached",
+    r"increase the limits by adding credits",
+    r"流量不足",
+    r"额度不足",
+    r"配额不足",
+    r"额度用尽",
+    r"用量已达上限",
+    r"达到使用上限",
+]
+for pat in patterns:
+    if re.search(pat, text, flags=re.IGNORECASE):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 review_has_no_issues() {
   local review_text="$1"
 
@@ -242,34 +268,6 @@ for key, count in counts.most_common():
 PY
 }
 
-get_pr_base_head() {
-  local gh_repo="$1"
-  local pr_number="$2"
-
-  gh pr view --repo "$gh_repo" "$pr_number" --json baseRefOid,headRefOid --jq '"\(.baseRefOid)\t\(.headRefOid)"' 2>/dev/null || true
-}
-
-find_intro_commit() {
-  local repo_path="$1"
-  local base_sha="$2"
-  local head_sha="$3"
-  local file_path="$4"
-
-  if [[ -z "$repo_path" || -z "$base_sha" || -z "$head_sha" || -z "$file_path" ]]; then
-    return 1
-  fi
-
-  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
-    git -C "$repo_path" fetch origin >/dev/null 2>&1 || true
-  fi
-
-  if ! git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
-    return 1
-  fi
-
-  git -C "$repo_path" log --reverse --format='%H%x1f%an%x1f%ae%x1f%s' "${base_sha}..${head_sha}" -- "$file_path" | head -n 1
-}
-
 resolve_lark_webhook() {
   if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
     if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
@@ -285,25 +283,13 @@ resolve_lark_webhook() {
   printf '%s' "$LARK_WEBHOOK_URL"
 }
 
-gitlab_commit_url() {
-  local gitlab_path="$1"
-  local sha="$2"
-  local proto="${GITLAB_PROTOCOL:-https}"
-  local host="${GITLAB_HOST:-}"
-
-  if [[ -z "$host" ]]; then
-    return 1
-  fi
-
-  printf '%s://%s/%s/commit/%s' "$proto" "$host" "$gitlab_path" "$sha"
-}
-
 check_lark_response() {
   local body="$1"
 
   RESPONSE_BODY="$body" python3 - <<'PY'
 import json
 import os
+import re
 import sys
 
 raw = os.environ.get("RESPONSE_BODY", "").strip()
@@ -708,6 +694,7 @@ get_review_text() {
   python3 - <<'PY'
 import json
 import os
+import re
 import sys
 
 raw = os.environ.get("PR_JSON", "")
@@ -731,47 +718,74 @@ def author_login(item):
     login = (item.get("author") or {}).get("login") if isinstance(item, dict) else ""
     return (login or "").lower()
 
+def looks_like_review(text: str) -> bool:
+    if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
+        return True
+    return "```" in text
+
+def should_skip_text(text: str, prompt_text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if prompt_text and prompt_text in text:
+        return True
+    if stripped in ("已发送日报", "已发送周报", "审查结果已发送。", "审查结果已发送"):
+        return True
+    return False
+
 texts = []
 location = None
 if author:
     for item in comments:
-        if author_login(item) in ignore:
-            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
+                if should_skip_text(text, prompt):
+                    continue
+                if author_login(item) in ignore and not looks_like_review(text):
+                    continue
                 texts.append(text)
     for item in reviews:
-        if author_login(item) in ignore:
-            continue
         if (item.get("author") or {}).get("login") == author:
             text = body_text(item)
             if text:
+                if should_skip_text(text, prompt):
+                    continue
+                if author_login(item) in ignore and not looks_like_review(text):
+                    continue
                 texts.append(text)
 else:
     for item in comments:
-        if author_login(item) in ignore:
-            continue
         text = body_text(item)
         if not text:
             continue
-        if prompt and prompt in text:
+        if should_skip_text(text, prompt):
+            continue
+        if author_login(item) in ignore and not looks_like_review(text):
             continue
         texts.append(text)
     for item in reviews:
-        if author_login(item) in ignore:
-            continue
         text = body_text(item)
         if text:
+            if should_skip_text(text, prompt):
+                continue
+            if author_login(item) in ignore and not looks_like_review(text):
+                continue
             texts.append(text)
 
+has_review_text = any(looks_like_review(text) for text in texts)
 for item in review_comments or []:
     login = ((item.get("user") or {}).get("login") or "").lower()
-    if login and login in ignore:
-        continue
     text = item.get("body")
     if text:
-        texts.append(text)
+        if should_skip_text(text, prompt):
+            continue
+        if login and login in ignore and not looks_like_review(text):
+            continue
+        if not has_review_text:
+            texts.append(text)
     if location is None:
         path = item.get("path")
         line = item.get("line") or item.get("original_line") or item.get("position")
@@ -784,6 +798,77 @@ if location:
 
 print("\n".join(texts))
 PY
+}
+
+fetch_review_comment_locations() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local json
+
+  json="$(gh api "repos/$gh_repo/pulls/$pr_number/comments" 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 1
+  fi
+
+  REVIEW_COMMENTS_JSON="$json" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+raw = os.environ.get("REVIEW_COMMENTS_JSON", "")
+if not raw.strip():
+    sys.exit(1)
+
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(1)
+
+def is_issue(text: str) -> bool:
+    if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
+        return True
+    if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
+        return True
+    return "```" in text
+
+for item in data or []:
+    body = (item.get("body") or "").strip()
+    if not body or not is_issue(body):
+        continue
+    path = item.get("path")
+    line = item.get("line") or item.get("original_line") or item.get("position")
+    commit = item.get("commit_id") or item.get("original_commit_id")
+    if path and line and commit:
+        print(f"{commit}\t{path}\t{line}\t{line}")
+PY
+}
+
+collect_issue_snippets() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local branch="$3"
+  local repo_path
+  local locations
+  local snippet
+  local lang
+  local location
+
+  repo_path="$(repo_dir "$gh_repo")"
+  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
+  if [[ -z "$locations" ]]; then
+    return 0
+  fi
+
+  while IFS=$'\t' read -r commit path start end; do
+    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
+    snippet="$(get_code_snippet "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
+    if [[ -n "$snippet" ]]; then
+      lang="$(code_lang "$path")"
+      location="${path}:${start}-${end}"
+      printf '%s\037```%s\n%s\n```\0' "$location" "$lang" "$snippet"
+    fi
+  done <<< "$locations"
 }
 
 summarize_review_with_ai() {
@@ -802,6 +887,7 @@ summarize_review_with_ai() {
   python3 - <<'PY'
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -1136,6 +1222,7 @@ build_payload() {
   TITLE="$title" REPORT_CONTENT="$content" python3 - <<'PY'
 import json
 import os
+import re
 import sys
 
 title = os.environ["TITLE"]
@@ -1189,6 +1276,69 @@ def build_post_payload(title, content):
 
 def build_card_v2_payload(title, content):
     content = content.strip() or "暂无审计结果。"
+    date = ""
+    repo = ""
+    match = re.match(r"^每周代码审查报告（([^）]+)）\s*-\s*(.+)$", title)
+    if match:
+        date = match.group(1).strip()
+        repo = match.group(2).strip()
+
+    parts = content.split("\n<br>\n<br>\n", 1)
+    meta_block = ""
+    findings_block = content.strip()
+    if len(parts) == 2:
+        meta_block = parts[0].strip()
+        findings_block = parts[1].strip()
+
+    if findings_block.startswith("【发现】"):
+        findings_block = findings_block[len("【发现】"):].lstrip()
+
+    issue_count = 0
+    max_severity = None
+    in_code = False
+    for line in findings_block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if stripped.startswith("- "):
+            issue_count += 1
+            sev_match = re.search(r"\bP[0-5]\b", stripped)
+            if sev_match:
+                sev = sev_match.group(0)
+                if max_severity is None or int(sev[1]) < int(max_severity[1]):
+                    max_severity = sev
+
+    overview_lines = []
+    if repo:
+        overview_lines.append(f"**仓库**：`{repo}`")
+    if date:
+        overview_lines.append(f"**日期**：{date}")
+    if issue_count:
+        severity_colors = {
+            "P0": "red",
+            "P1": "orange",
+            "P2": "yellow",
+            "P3": "blue",
+            "P4": "green",
+            "P5": "neutral",
+        }
+        color = severity_colors.get(max_severity, "blue")
+        overview_lines.append(f"**风险**：<text_tag color='{color}'>{issue_count} 项</text_tag>")
+    overview_md = "\n".join(overview_lines)
+
+    elements = []
+    if overview_md:
+        elements.append({"tag": "markdown", "content": overview_md, "text_size": "normal"})
+    if meta_block:
+        elements.append({"tag": "markdown", "content": meta_block, "text_size": "notation"})
+    if overview_md or meta_block:
+        elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": "## 发现"})
+    elements.append({"tag": "markdown", "content": findings_block or "暂无审计结果。"})
+
     return {
         "msg_type": "interactive",
         "card": {
@@ -1199,9 +1349,7 @@ def build_card_v2_payload(title, content):
                 "template": "blue",
             },
             "body": {
-                "elements": [
-                    {"tag": "markdown", "content": content}
-                ]
+                "elements": elements
             },
         },
     }
@@ -1269,6 +1417,11 @@ if [[ -s "$RUN_FILE" ]]; then
       continue
     fi
 
+    if codex_usage_limited "$review_text"; then
+      log "识别到流量不足，跳过：$gitlab_path@$branch"
+      continue
+    fi
+
     if review_has_no_issues "$review_text"; then
       log "审查无风险项，跳过发送：$gitlab_path@$branch"
       continue
@@ -1283,55 +1436,38 @@ if [[ -s "$RUN_FILE" ]]; then
 
     location_info="$(extract_location "$review_text")"
     location=""
-    snippet=""
     path=""
-    mention_line=""
-    intro_line=""
-    intro_commit_block=""
     if [[ -n "$location_info" ]]; then
       read -r commit path start end <<< "$location_info"
       location="${path}:${start}-${end}"
       repo_path="$(repo_dir "$gh_repo")"
-      snippet="$(get_code_snippet "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-      authors_tsv="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-      if [[ -n "$authors_tsv" ]]; then
-        mention_line="$(format_mention_line "$authors_tsv" || true)"
-      fi
 
-      if [[ -n "$repo_path" && -n "$path" ]]; then
-        if pr_range="$(get_pr_base_head "$gh_repo" "$pr_number")"; then
-          read -r pr_base pr_head <<< "$pr_range"
-          intro_commit="$(find_intro_commit "$repo_path" "$pr_base" "$pr_head" "$path" || true)"
-          if [[ -n "$intro_commit" ]]; then
-            IFS=$'\x1f' read -r intro_sha intro_name intro_email intro_subject <<< "$intro_commit"
-            intro_desc="${intro_sha:0:7}"
-            if [[ -n "$intro_name" ]]; then
-              intro_desc+=" $intro_name"
-            fi
-            if [[ -n "$intro_subject" ]]; then
-              intro_desc+=" $intro_subject"
-            fi
-            intro_url="$(gitlab_commit_url "$gitlab_path" "$intro_sha" || true)"
-            if [[ -n "$intro_url" ]]; then
-              intro_commit_block="【引入提交】"$'\n\n'"• [${intro_sha:0:7}]($intro_url)"
-              if [[ -n "$intro_name" || -n "$intro_subject" ]]; then
-                intro_commit_block+=" $intro_name $intro_subject"
-              fi
-            else
-              intro_commit_block="【引入提交】"$'\n\n'"• $intro_desc"
-            fi
-            intro_line="$(format_single_mention "引入人" "$intro_name" "$intro_email" || true)"
-          fi
-        fi
-      fi
     fi
 
     content=""
     summary_lines=""
+    issue_entries=()
+    while IFS= read -r -d '' entry; do
+      issue_entries+=("$entry")
+    done < <(collect_issue_snippets "$gh_repo" "$pr_number" "$branch")
     if summary_lines="$(summarize_review_with_ai "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
       if [[ -n "$summary_lines" ]]; then
+        snippet_index=0
         while IFS=$'\t' read -r severity summary suggestion; do
           [[ -z "$severity" || "$severity" == "NONE" ]] && continue
+          entry_location=""
+          entry_snippet=""
+          if [[ "$snippet_index" -lt "${#issue_entries[@]}" ]]; then
+            entry="${issue_entries[$snippet_index]}"
+            snippet_index=$((snippet_index + 1))
+            entry_location="${entry%%$'\037'*}"
+            if [[ "$entry_location" != "$entry" ]]; then
+              entry_snippet="${entry#*$'\037'}"
+            else
+              entry_location=""
+              entry_snippet=""
+            fi
+          fi
           color="orange"
           label="$severity"
           case "$severity" in
@@ -1347,13 +1483,19 @@ if [[ -s "$RUN_FILE" ]]; then
           else
             line="- [$label] $summary"
           fi
-          if [[ -n "$location" || -n "$suggestion" ]]; then
+          line_location=""
+          if [[ -n "$entry_location" ]]; then
+            line_location="$entry_location"
+          elif [[ "${#issue_entries[@]}" -eq 0 ]]; then
+            line_location="$location"
+          fi
+          if [[ -n "$line_location" || -n "$suggestion" ]]; then
             line+="（"
-            if [[ -n "$location" ]]; then
-              line+="位置: $location"
+            if [[ -n "$line_location" ]]; then
+              line+="位置: $line_location"
             fi
             if [[ -n "$suggestion" ]]; then
-              if [[ -n "$location" ]]; then
+              if [[ -n "$line_location" ]]; then
                 line+="，"
               fi
               line+="建议: $suggestion"
@@ -1361,60 +1503,33 @@ if [[ -s "$RUN_FILE" ]]; then
             line+="）"
           fi
           content+="$line"$'\n'
+          if [[ -n "$entry_snippet" ]]; then
+            content+="$entry_snippet"$'\n'
+          fi
         done <<< "$summary_lines"
       fi
     fi
 
     if [[ -z "$(printf '%s' "$content" | tr -d '[:space:]')" ]]; then
-      content="$(normalize_review_text "$review_text")"
-    fi
-
-    if [[ -z "$(printf '%s' "$content" | tr -d '[:space:]')" ]]; then
-      log "审查内容为空，跳过发送：$gitlab_path@$branch"
+      log "审查摘要为空，跳过发送：$gitlab_path@$branch"
       continue
     fi
 
-    author_block=""
-    authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
-    if [[ -n "$authors_tsv" ]]; then
-      author_block="$(format_mention_line "$authors_tsv" "变更人" || true)"
+    daily_commit_block=""
+    daily_authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
+    if [[ -n "$daily_authors_tsv" ]]; then
+      daily_commit_block="$(format_mention_line "$daily_authors_tsv" "提交人" || true)"
     fi
 
     final_content=""
-    if [[ -n "$mention_line" ]]; then
-      final_content+="$mention_line"
-    fi
-    if [[ -n "$intro_line" ]]; then
-      if [[ -n "$final_content" ]]; then
-        final_content+=$'\n'
-      fi
-      final_content+="$intro_line"
-    fi
-    if [[ -n "$author_block" ]]; then
-      if [[ -n "$final_content" ]]; then
-        final_content+=$'\n\n'
-      fi
-      final_content+="$author_block"
-    fi
-    if [[ -n "$intro_commit_block" ]]; then
-      if [[ -n "$final_content" ]]; then
-        final_content+=$'\n\n'
-      fi
-      final_content+="$intro_commit_block"
+    if [[ -n "$daily_commit_block" ]]; then
+      final_content+="$daily_commit_block"
     fi
     if [[ -n "$final_content" ]]; then
       final_content+=$'\n<br>\n<br>\n'
     fi
     final_content+="【发现】"$'\n\n'
     final_content+="$content"
-
-    if [[ -n "$snippet" ]]; then
-      lang="$(code_lang "$path")"
-      final_content+=$'\n'"**代码片段：**"$'\n'
-      final_content+='```'"$lang"$'\n'
-      final_content+="$snippet"$'\n'
-      final_content+='```'$'\n'
-    fi
 
     title="每周代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
     payload="$(build_payload "$title" "$final_content")"
