@@ -1437,11 +1437,15 @@ if [[ -s "$RUN_FILE" ]]; then
     location_info="$(extract_location "$review_text")"
     location=""
     path=""
+    location_commit=""
+    location_path=""
+    location_start=""
+    location_end=""
     if [[ -n "$location_info" ]]; then
-      read -r commit path start end <<< "$location_info"
-      location="${path}:${start}-${end}"
+      read -r location_commit location_path location_start location_end <<< "$location_info"
+      path="$location_path"
+      location="${location_path}:${location_start}-${location_end}"
       repo_path="$(repo_dir "$gh_repo")"
-
     fi
 
     content=""
@@ -1450,6 +1454,15 @@ if [[ -s "$RUN_FILE" ]]; then
     while IFS= read -r -d '' entry; do
       issue_entries+=("$entry")
     done < <(collect_issue_snippets "$gh_repo" "$pr_number" "$branch")
+    if [[ "${#issue_entries[@]}" -eq 0 && -n "$location_commit" && -n "$location_path" ]]; then
+      fallback_snippet="$(get_code_snippet "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
+      if [[ -n "$fallback_snippet" ]]; then
+        lang="$(code_lang "$location_path")"
+        entry_location="${location_path}:${location_start}-${location_end}"
+        snippet_block="$(printf '```%s\n%s\n```' "$lang" "$fallback_snippet")"
+        issue_entries+=("${entry_location}"$'\037'"$snippet_block")
+      fi
+    fi
     if summary_lines="$(summarize_review_with_ai "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
       if [[ -n "$summary_lines" ]]; then
         snippet_index=0
