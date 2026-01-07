@@ -90,6 +90,70 @@ strip_comment() {
   printf '%s' "${line%%#*}"
 }
 
+parse_repo_line() {
+  local raw="$1"
+  local line repo_spec cadence
+
+  line="$(strip_comment "$raw")"
+  line="$(printf '%s' "$line" | awk '{$1=$1; print}')"
+  [[ -z "$line" ]] && return 1
+
+  read -r repo_spec cadence _ <<< "$line"
+  [[ -z "$repo_spec" ]] && return 1
+
+  printf '%s\t%s\n' "$repo_spec" "$cadence"
+}
+
+normalize_cadence() {
+  local raw="${1:-}"
+
+  case "$raw" in
+    ""|weekly|week)
+      printf 'weekly'
+      return 0
+      ;;
+    daily|day)
+      printf 'daily'
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cadence_title_label() {
+  local cadence="${1:-}"
+
+  case "$cadence" in
+    daily)
+      printf '每日'
+      ;;
+    weekly)
+      printf '每周'
+      ;;
+    *)
+      printf '每周'
+      ;;
+  esac
+}
+
+cadence_report_label() {
+  local cadence="${1:-}"
+
+  case "$cadence" in
+    daily)
+      printf '日报'
+      ;;
+    weekly)
+      printf '周报'
+      ;;
+    *)
+      printf '周报'
+      ;;
+  esac
+}
+
 gitlab_remote_name() {
   printf '%s' "${GITLAB_REMOTE_NAME:-gitlab}"
 }

@@ -105,13 +105,13 @@ synced=0
 failed=0
 
 while IFS= read -r raw || [[ -n "$raw" ]]; do
-  line="$(strip_comment "$raw")"
-  line="$(printf '%s' "$line" | awk '{$1=$1; print}')"
-  [[ -z "$line" ]] && continue
+  parsed="$(parse_repo_line "$raw" || true)"
+  [[ -z "$parsed" ]] && continue
+  IFS=$'\t' read -r repo_spec _ <<< "$parsed"
 
   total=$((total + 1))
-  gitlab_path="${line%@*}"
-  branch="${line#*@}"
+  gitlab_path="${repo_spec%@*}"
+  branch="${repo_spec#*@}"
   if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
     branch="$DEFAULT_BRANCH"
   fi

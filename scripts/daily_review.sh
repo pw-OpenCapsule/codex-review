@@ -37,6 +37,7 @@ done
 ensure_dirs
 
 TODAY="$(TZ="$TZ" date +%F)"
+TODAY_DOW="$(TZ="$TZ" date +%u)"
 RUN_FILE_BASE="run-$TODAY"
 QUEUE_FILE_BASE="queue-$TODAY"
 if (( DRY_RUN )); then
@@ -50,10 +51,11 @@ else
 fi
 RUN_SENT_FILE="$RUN_DIR/run-$TODAY.sent"
 REVIEW_RANGE="${REVIEW_RANGE:-yesterday}"
+DAILY_REVIEW_RANGE="${DAILY_REVIEW_RANGE:-$REVIEW_RANGE}"
+WEEKLY_REVIEW_RANGE="${WEEKLY_REVIEW_RANGE:-$REVIEW_RANGE}"
+WEEKLY_REVIEW_DOW="${WEEKLY_REVIEW_DOW:-}"
 LOG_YESTERDAY_COMMITS="${LOG_YESTERDAY_COMMITS:-1}"
 YESTERDAY_LOG_LIMIT="${YESTERDAY_LOG_LIMIT:-20}"
-RANGE_START_DATE=""
-RANGE_END_DATE=""
 
 : > "$RUN_FILE_TMP"
 : > "$QUEUE_FILE"
@@ -83,11 +85,12 @@ date_days_ago() {
 }
 
 resolve_date_range() {
+  local range_mode="$1"
   local start_date=""
   local end_date=""
   local dow=""
 
-  case "$REVIEW_RANGE" in
+  case "$range_mode" in
     yesterday)
       start_date="$(yesterday_date)"
       end_date="$start_date"
@@ -114,12 +117,47 @@ resolve_date_range() {
   printf '%s\t%s\n' "$start_date" "$end_date"
 }
 
-if [[ "$REVIEW_RANGE" == "yesterday" || "$REVIEW_RANGE" == "workday" ]]; then
-  if ! range_output="$(resolve_date_range)"; then
-    exit 0
+review_range_for_cadence() {
+  local cadence="$1"
+
+  case "$cadence" in
+    daily)
+      printf '%s' "$DAILY_REVIEW_RANGE"
+      ;;
+    weekly)
+      printf '%s' "$WEEKLY_REVIEW_RANGE"
+      ;;
+    *)
+      printf '%s' "$REVIEW_RANGE"
+      ;;
+  esac
+}
+
+ensure_weekly_dow() {
+  if [[ -z "$WEEKLY_REVIEW_DOW" ]]; then
+    return 0
   fi
-  read -r RANGE_START_DATE RANGE_END_DATE <<< "$range_output"
-fi
+
+  if [[ ! "$WEEKLY_REVIEW_DOW" =~ ^[1-7]$ ]]; then
+    die "WEEKLY_REVIEW_DOW 无效：$WEEKLY_REVIEW_DOW（应为 1-7，周一=1）"
+  fi
+}
+
+should_run_cadence() {
+  local cadence="$1"
+
+  if [[ "$cadence" != "weekly" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$WEEKLY_REVIEW_DOW" ]]; then
+    return 0
+  fi
+
+  [[ "$TODAY_DOW" == "$WEEKLY_REVIEW_DOW" ]]
+}
+
+ensure_weekly_dow
 
 resolve_initial_base() {
   local dir="$1"
@@ -384,17 +422,36 @@ collect_queue() {
   local gitlab_path branch gh_repo dir head_sha base_sha score loc risk initial_ref
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
-    local line
+    local parsed repo_spec cadence_raw cadence
     local repo_created=0
     local tracking_ref
-    line="$(strip_comment "$raw")"
-    line="$(printf '%s' "$line" | awk '{$1=$1; print}')"
-    [[ -z "$line" ]] && continue
+    local range_mode range_start_date range_end_date range_output
+    parsed="$(parse_repo_line "$raw" || true)"
+    [[ -z "$parsed" ]] && continue
 
-    gitlab_path="${line%@*}"
-    branch="${line#*@}"
+    IFS=$'\t' read -r repo_spec cadence_raw <<< "$parsed"
+    if ! cadence="$(normalize_cadence "$cadence_raw")"; then
+      log "无效审计频率，跳过：$repo_spec $cadence_raw"
+      continue
+    fi
+
+    gitlab_path="${repo_spec%@*}"
+    branch="${repo_spec#*@}"
     if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
       branch="$DEFAULT_BRANCH"
+    fi
+
+    if ! should_run_cadence "$cadence"; then
+      log "$gitlab_path@$branch 每周审计仅在周$WEEKLY_REVIEW_DOW 运行，跳过"
+      continue
+    fi
+
+    range_mode="$(review_range_for_cadence "$cadence")"
+    if [[ "$range_mode" == "yesterday" || "$range_mode" == "workday" ]]; then
+      if ! range_output="$(resolve_date_range "$range_mode")"; then
+        continue
+      fi
+      read -r range_start_date range_end_date <<< "$range_output"
     fi
 
     gh_repo="$(github_repo "$gitlab_path")"
@@ -437,11 +494,11 @@ collect_queue() {
       else
         base_sha="$(resolve_initial_base "$dir" "$head_sha" "$initial_ref")"
       fi
-    elif [[ "$REVIEW_RANGE" == "yesterday" || "$REVIEW_RANGE" == "workday" ]]; then
-      if read -r base_sha head_sha < <(range_shas_for_dates "$dir" "$tracking_ref" "$RANGE_START_DATE" "$RANGE_END_DATE"); then
+    elif [[ "$range_mode" == "yesterday" || "$range_mode" == "workday" ]]; then
+      if read -r base_sha head_sha < <(range_shas_for_dates "$dir" "$tracking_ref" "$range_start_date" "$range_end_date"); then
         :
       else
-        if [[ "$REVIEW_RANGE" == "workday" ]]; then
+        if [[ "$range_mode" == "workday" ]]; then
           log "$gitlab_path@$branch 工作日无提交"
         else
           log "$gitlab_path@$branch 昨日无提交"
@@ -463,18 +520,18 @@ collect_queue() {
     fi
 
     if [[ "$LOG_YESTERDAY_COMMITS" == "1" ]]; then
-      if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+      if [[ "$range_mode" == "yesterday" ]]; then
         log_yesterday_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" || true
-      elif [[ "$REVIEW_RANGE" == "workday" ]]; then
-        log_range_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" "$RANGE_START_DATE" "$RANGE_END_DATE" \
-          "工作日提交 (${RANGE_START_DATE}~${RANGE_END_DATE})" || true
+      elif [[ "$range_mode" == "workday" ]]; then
+        log_range_commits "$dir" "$tracking_ref" "$YESTERDAY_LOG_LIMIT" "$range_start_date" "$range_end_date" \
+          "工作日提交 (${range_start_date}~${range_end_date})" || true
       fi
     fi
 
     if [[ "$base_sha" == "$head_sha" ]]; then
-      if [[ "$REVIEW_RANGE" == "yesterday" ]]; then
+      if [[ "$range_mode" == "yesterday" ]]; then
         log "$gitlab_path@$branch 昨日无变更"
-      elif [[ "$REVIEW_RANGE" == "workday" ]]; then
+      elif [[ "$range_mode" == "workday" ]]; then
         log "$gitlab_path@$branch 工作日无变更"
       else
         log "$gitlab_path@$branch 无变更"
@@ -483,8 +540,8 @@ collect_queue() {
     fi
 
     read -r score loc risk < <(compute_score "$dir" "$base_sha" "$head_sha")
-    log "加入队列 $gitlab_path@$branch 评分=$score 行数=$loc 风险文件=$risk"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$score" "$gitlab_path" "$branch" "$base_sha" "$head_sha" >> "$QUEUE_FILE"
+    log "加入队列 $gitlab_path@$branch 频率=$cadence 评分=$score 行数=$loc 风险文件=$risk"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$score" "$gitlab_path" "$branch" "$base_sha" "$head_sha" "$cadence" >> "$QUEUE_FILE"
   done < "$ROOT_DIR/config/repos.txt"
 }
 
@@ -494,6 +551,7 @@ create_or_find_pr() {
   local base_sha="$3"
   local head_sha="$4"
   local branch="$5"
+  local review_label="${6:-每周}"
   local branch_slug="${branch//\//-}"
   local base_branch="audit/base/$TODAY-$branch_slug"
   local head_branch="audit/head/$TODAY-$branch_slug"
@@ -520,8 +578,8 @@ create_or_find_pr() {
     --repo "$gh_repo" \
     --base "$base_branch" \
     --head "$head_branch" \
-    --title "【每周审计】$TODAY ($branch)" \
-    --body "每周审计差异：${base_sha} -> ${head_sha}，分支：${branch}。" \
+    --title "【${review_label}审计】$TODAY ($branch)" \
+    --body "${review_label}审计差异：${base_sha} -> ${head_sha}，分支：${branch}。" \
     >/dev/null
 
   pr_number="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state open --json number --jq '.[0].number // empty')"
@@ -672,7 +730,7 @@ auto_send_report() {
 
 process_queue() {
   local count=0
-  local score gitlab_path branch base_sha head_sha gh_repo dir pr_number pr_url
+  local score gitlab_path branch base_sha head_sha cadence gh_repo dir pr_number pr_url
 
   if [[ ! -s "$QUEUE_FILE" ]]; then
     log "无待处理变更"
@@ -681,7 +739,7 @@ process_queue() {
 
   sort -nr "$QUEUE_FILE" > "$QUEUE_FILE.sorted"
 
-  while IFS=$'\t' read -r score gitlab_path branch base_sha head_sha; do
+  while IFS=$'\t' read -r score gitlab_path branch base_sha head_sha cadence; do
     if (( MAX_REVIEWS_PER_RUN > 0 && count >= MAX_REVIEWS_PER_RUN )); then
       log "达到 MAX_REVIEWS_PER_RUN=$MAX_REVIEWS_PER_RUN 限制"
       break
@@ -689,6 +747,8 @@ process_queue() {
 
     gh_repo="$(github_repo "$gitlab_path")"
     dir="$(repo_dir "$gh_repo")"
+    local review_label
+    review_label="$(cadence_title_label "$cadence")"
 
     if (( DRY_RUN )); then
       local branch_slug head_branch pr_existing
@@ -699,14 +759,14 @@ process_queue() {
         pr_url="$(gh pr view --repo "$gh_repo" "$pr_existing" --json url --jq '.url')"
         log "DRY RUN: 复用 PR $pr_url"
       else
-        log "DRY RUN: 将创建 PR $gh_repo $branch ($base_sha -> $head_sha)"
+      log "DRY RUN: 将创建 PR $gh_repo $branch ($base_sha -> $head_sha)"
       fi
       log "DRY RUN: 将评论 @codex ($gitlab_path@$branch)"
       count=$((count + 1))
       continue
     fi
 
-    pr_number="$(create_or_find_pr "$gh_repo" "$dir" "$base_sha" "$head_sha" "$branch")"
+    pr_number="$(create_or_find_pr "$gh_repo" "$dir" "$base_sha" "$head_sha" "$branch" "$review_label")"
     if [[ -z "$pr_number" ]]; then
       log "创建拉取请求失败：$gitlab_path@$branch"
       continue
