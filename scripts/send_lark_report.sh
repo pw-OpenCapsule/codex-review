@@ -13,6 +13,71 @@ ensure_dirs
 
 ensure_gh_auth
 
+REPO_KEYS=()
+REPO_CADENCES=()
+
+set_repo_cadence() {
+  local key="$1"
+  local cadence="$2"
+  local i
+
+  for i in "${!REPO_KEYS[@]}"; do
+    if [[ "${REPO_KEYS[$i]}" == "$key" ]]; then
+      REPO_CADENCES[$i]="$cadence"
+      return 0
+    fi
+  done
+
+  REPO_KEYS+=("$key")
+  REPO_CADENCES+=("$cadence")
+}
+
+load_repo_cadences() {
+  local raw parsed repo_spec cadence_raw cadence gitlab_path branch
+  REPO_KEYS=()
+  REPO_CADENCES=()
+
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    parsed="$(parse_repo_line "$raw" || true)"
+    [[ -z "$parsed" ]] && continue
+    IFS=$'\t' read -r repo_spec cadence_raw <<< "$parsed"
+
+    gitlab_path="${repo_spec%@*}"
+    branch="${repo_spec#*@}"
+    if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
+      branch="$DEFAULT_BRANCH"
+    fi
+
+    if ! cadence="$(normalize_cadence "$cadence_raw")"; then
+      log "无效审计频率，默认每周：$repo_spec $cadence_raw"
+      cadence="weekly"
+    fi
+
+    set_repo_cadence "$gitlab_path@$branch" "$cadence"
+  done < "$ROOT_DIR/config/repos.txt"
+}
+
+repo_cadence_for() {
+  local gitlab_path="$1"
+  local branch="$2"
+  local key="${gitlab_path}@${branch}"
+  local cadence=""
+  local i
+
+  for i in "${!REPO_KEYS[@]}"; do
+    if [[ "${REPO_KEYS[$i]}" == "$key" ]]; then
+      cadence="${REPO_CADENCES[$i]}"
+      break
+    fi
+  done
+
+  if [[ -z "$cadence" ]]; then
+    cadence="weekly"
+  fi
+
+  printf '%s' "$cadence"
+}
+
 usage() {
   cat <<'EOF'
 Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n]
@@ -57,12 +122,14 @@ if [[ "$REPORT_DATE" != "$TODAY" && "${LARK_DRY_RUN:-0}" != "1" ]]; then
   exit 0
 fi
 
+load_repo_cadences
+
 report_already_sent() {
   local gh_repo="$1"
   local pr_number="$2"
   local already
 
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("已发送周报")] | any')"
+  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | (contains("已发送周报") or contains("已发送日报"))] | any')"
   [[ "$already" == "true" ]]
 }
 
@@ -100,6 +167,7 @@ post_report_comment() {
   local gh_repo="$1"
   local pr_number="$2"
   local content="$3"
+  local marker="$4"
   local normalized
 
   normalized="$(normalize_for_pr_comment "$content")"
@@ -108,7 +176,7 @@ post_report_comment() {
   fi
 
   gh pr comment --repo "$gh_repo" "$pr_number" --body "$normalized" >/dev/null
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "已发送周报" >/dev/null
+  gh pr comment --repo "$gh_repo" "$pr_number" --body "$marker" >/dev/null
 }
 
 codex_setup_required() {
@@ -1125,13 +1193,13 @@ build_run_file_from_prs() {
   : > "$RUN_FILE"
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
-    local line
-    line="$(strip_comment "$raw")"
-    line="$(printf '%s' "$line" | awk '{$1=$1; print}')"
-    [[ -z "$line" ]] && continue
+    local parsed repo_spec
+    parsed="$(parse_repo_line "$raw" || true)"
+    [[ -z "$parsed" ]] && continue
+    IFS=$'\t' read -r repo_spec _ <<< "$parsed"
 
-    gitlab_path="${line%@*}"
-    branch="${line#*@}"
+    gitlab_path="${repo_spec%@*}"
+    branch="${repo_spec#*@}"
     if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
       branch="$DEFAULT_BRANCH"
     fi
@@ -1188,11 +1256,12 @@ with open(config_path, "r", encoding="utf-8") as fh:
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        if "@" in line:
-            path, branch = line.split("@", 1)
+        repo_spec = line.split(None, 1)[0]
+        if "@" in repo_spec:
+            path, branch = repo_spec.split("@", 1)
             branch = branch.strip() or default_branch
         else:
-            path = line.strip()
+            path = repo_spec.strip()
             branch = default_branch
         key = f"{path}@{branch}"
         if key not in entries:
@@ -1276,7 +1345,7 @@ def build_card_v2_payload(title, content):
     content = content.strip() or "暂无审计结果。"
     date = ""
     repo = ""
-    match = re.match(r"^每周代码审查报告（([^）]+)）\s*-\s*(.+)$", title)
+    match = re.match(r"^每[日周]代码审查报告（([^）]+)）\s*-\s*(.+)$", title)
     if match:
         date = match.group(1).strip()
         repo = match.group(2).strip()
@@ -1394,9 +1463,14 @@ if [[ -s "$RUN_FILE" ]]; then
       fi
     fi
 
+    cadence="$(repo_cadence_for "$gitlab_path" "$branch")"
+    report_label="$(cadence_title_label "$cadence")"
+    report_marker="$(cadence_report_label "$cadence")"
+    report_marker_text="已发送${report_marker}"
+
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
       if report_already_sent "$gh_repo" "$pr_number"; then
-        log "已发送周报，跳过：$gitlab_path@$branch"
+        log "$report_marker_text，跳过：$gitlab_path@$branch"
         continue
       fi
     fi
@@ -1538,7 +1612,7 @@ if [[ -s "$RUN_FILE" ]]; then
     final_content+="【发现】"$'\n\n'
     final_content+="$content"
 
-    title="每周代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
+    title="${report_label}代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
     payload="$(build_payload "$title" "$final_content")"
 
     repo_slug="${gitlab_path//\//_}-${branch//\//-}"
@@ -1579,10 +1653,10 @@ if [[ -s "$RUN_FILE" ]]; then
     fi
 
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
-      post_report_comment "$gh_repo" "$pr_number" "$final_content"
-      log "已发送周报：$gitlab_path@$branch"
+      post_report_comment "$gh_repo" "$pr_number" "$final_content" "$report_marker_text"
+      log "已发送${report_marker}：$gitlab_path@$branch"
     else
-      log "DRY_RUN=1，已发送测试周报：$gitlab_path@$branch"
+      log "DRY_RUN=1，已发送测试${report_marker}：$gitlab_path@$branch"
     fi
     sent_any=1
   done < "$RUN_FILE"

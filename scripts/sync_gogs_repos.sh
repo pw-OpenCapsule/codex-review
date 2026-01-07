@@ -243,7 +243,8 @@ new_path = os.environ["NEW_PATH"]
 mode = os.environ.get("WRITE_MODE", "merge")
 
 header = []
-existing = []
+existing_map = {}
+existing_order = []
 if os.path.exists(output_path):
     header_done = False
     with open(output_path, "r", encoding="utf-8") as fh:
@@ -255,34 +256,61 @@ if os.path.exists(output_path):
                 continue
             header_done = True
             if stripped and not stripped.startswith("#"):
-                existing.append(stripped)
+                parts = stripped.split()
+                repo_spec = parts[0] if parts else ""
+                cadence = parts[1] if len(parts) > 1 else ""
+                if not repo_spec:
+                    continue
+                if repo_spec not in existing_map:
+                    existing_order.append(repo_spec)
+                if cadence:
+                    existing_map[repo_spec] = cadence
+                else:
+                    existing_map.setdefault(repo_spec, "")
 
 if not header:
     header = [
         "# 每行一个 GitLab 仓路径（group/project@branch）。",
         "# 分支可选，不写则使用 DEFAULT_BRANCH。",
+        "# 可选第二列：daily 或 weekly（默认 weekly）。",
         "# GitHub 镜像仓名根据 settings.env 的命名规则生成。",
-        "# platform/auth-service@main",
-        "# platform/payment-core@release",
+        "# platform/auth-service@main daily",
+        "# platform/payment-core@release weekly",
     ]
 
 with open(new_path, "r", encoding="utf-8") as fh:
-    new_entries = [line.strip() for line in fh if line.strip()]
+    new_specs = []
+    for raw in fh:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        repo_spec = parts[0] if parts else ""
+        if repo_spec:
+            new_specs.append(repo_spec)
 
 if mode == "overwrite":
-    merged = sorted(set(new_entries))
+    merged_order = sorted(set(new_specs))
+    merged_map = {spec: "" for spec in merged_order}
 elif mode == "append":
-    merged = existing[:]
-    for entry in new_entries:
-        if entry not in merged:
-            merged.append(entry)
+    merged_order = existing_order[:]
+    merged_map = dict(existing_map)
+    for spec in new_specs:
+        if spec not in merged_map:
+            merged_order.append(spec)
+            merged_map[spec] = ""
 else:
-    merged = sorted(set(existing).union(new_entries))
+    merged_order = sorted(set(existing_map).union(new_specs))
+    merged_map = dict(existing_map)
+    for spec in new_specs:
+        merged_map.setdefault(spec, "")
 
 with open(output_path, "w", encoding="utf-8") as fh:
     for line in header:
         fh.write(line + "\n")
-    for entry in merged:
+    for spec in merged_order:
+        cadence = merged_map.get(spec, "")
+        entry = f"{spec} {cadence}".strip()
         fh.write(entry + "\n")
 PY
 
