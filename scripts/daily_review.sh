@@ -718,13 +718,18 @@ auto_send_report() {
     return 0
   fi
 
+  if [[ "$TODAY_DOW" -ge 6 ]]; then
+    log "周末日报延后到周一发送"
+    return 0
+  fi
+
   if [[ ! -s "$RUN_FILE" ]]; then
     log "无运行记录，跳过发送报告"
     return 0
   fi
 
   wait_for_reviews "$RUN_FILE" || true
-  "$SCRIPT_DIR/send_lark_report.sh" "$TODAY"
+  "$SCRIPT_DIR/send_lark_report.sh"
   touch "$RUN_SENT_FILE"
 }
 

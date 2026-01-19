@@ -15,6 +15,7 @@ ensure_gh_auth
 
 REPO_KEYS=()
 REPO_CADENCES=()
+SUMMARY_FAILURES=()
 
 set_repo_cadence() {
   local key="$1"
@@ -78,6 +79,59 @@ repo_cadence_for() {
   printf '%s' "$cadence"
 }
 
+add_summary_failure() {
+  local entry="$1"
+  SUMMARY_FAILURES+=("$entry")
+}
+
+send_summary_alert_dry() {
+  local count="${#SUMMARY_FAILURES[@]}"
+  local title
+  local content
+  local response
+  local http_code
+  local body
+  local webhook_url
+
+  if (( count == 0 )); then
+    return 0
+  fi
+
+  if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
+    log "LARK_WEBHOOK_URL_DRY 为空，跳过 summary 告警"
+    return 0
+  fi
+
+  title="审计告警：summary 接口异常（${REPORT_DATE}）"
+  content="summary 接口调用失败 ${count} 项："
+  for entry in "${SUMMARY_FAILURES[@]}"; do
+    content+=$'\n'"- $entry"
+  done
+
+  payload="$(build_payload "$title" "$content")"
+  response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$LARK_WEBHOOK_URL_DRY")"
+  http_code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [[ "$http_code" != "200" ]]; then
+    log "summary 告警发送失败（HTTP ${http_code}）"
+    if [[ -n "$body" ]]; then
+      log "Lark 响应: $body"
+    fi
+    return 1
+  fi
+
+  if ! check_lark_response "$body"; then
+    log "summary 告警返回错误"
+    if [[ -n "$body" ]]; then
+      log "Lark 响应: $body"
+    fi
+    return 1
+  fi
+
+  log "summary 告警已发送（dry webhook）"
+}
+
 usage() {
   cat <<'EOF'
 Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n]
@@ -107,20 +161,61 @@ for arg in "$@"; do
   esac
 done
 
-REPORT_DATE="${DATE_INPUT:-$(TZ="$TZ" date +%F)}"
-RUN_FILE="$RUN_DIR/run-$REPORT_DATE.tsv"
+date_days_ago() {
+  local days="$1"
+
+  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "$days day ago" +%F
+  else
+    TZ="$TZ" date -v-"${days}"d +%F
+  fi
+}
+
 TODAY="$(TZ="$TZ" date +%F)"
+TODAY_DOW="$(TZ="$TZ" date +%u)"
 TARGET_ENTRY="${RETRY_ONLY:-}"
 SELF_GH_LOGIN="${SELF_GH_LOGIN:-}"
+SUMMARY_RETRY_COUNT="${SUMMARY_RETRY_COUNT:-3}"
+SUMMARY_RETRY_DELAY_SECONDS="${SUMMARY_RETRY_DELAY_SECONDS:-2}"
+ALLOW_ANY_DATE=0
+REPORT_DATES=()
+
+if [[ -n "$DATE_INPUT" ]]; then
+  REPORT_DATES=("$DATE_INPUT")
+  ALLOW_ANY_DATE=1
+elif [[ "$TODAY_DOW" -eq 1 ]]; then
+  REPORT_DATES=("$(date_days_ago 2)" "$(date_days_ago 1)" "$TODAY")
+else
+  REPORT_DATES=("$TODAY")
+fi
 
 if [[ -z "$SELF_GH_LOGIN" ]]; then
   SELF_GH_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
 fi
 
-if [[ "$REPORT_DATE" != "$TODAY" && "${LARK_DRY_RUN:-0}" != "1" ]]; then
-  log "报告日期非今日，跳过发送：$REPORT_DATE"
-  exit 0
-fi
+should_send_report_date() {
+  local report_date="$1"
+
+  if (( ALLOW_ANY_DATE )); then
+    return 0
+  fi
+
+  if [[ "$report_date" == "$TODAY" ]]; then
+    return 0
+  fi
+
+  if [[ "$TODAY_DOW" -eq 1 ]]; then
+    local saturday
+    local sunday
+    saturday="$(date_days_ago 2)"
+    sunday="$(date_days_ago 1)"
+    if [[ "$report_date" == "$saturday" || "$report_date" == "$sunday" ]]; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
 
 load_repo_cadences
 
@@ -1117,6 +1212,39 @@ for issue in issues:
 PY
 }
 
+summarize_review_with_retry() {
+  local repo="$1"
+  local branch="$2"
+  local pr_number="$3"
+  local review_text="$4"
+  local location="$5"
+  local attempts="$SUMMARY_RETRY_COUNT"
+  local delay="$SUMMARY_RETRY_DELAY_SECONDS"
+  local output=""
+  local attempt=1
+
+  if [[ ! "$attempts" =~ ^[0-9]+$ || "$attempts" -le 0 ]]; then
+    attempts=1
+  fi
+  if [[ ! "$delay" =~ ^[0-9]+$ || "$delay" -lt 0 ]]; then
+    delay=0
+  fi
+
+  while (( attempt <= attempts )); do
+    if output="$(summarize_review_with_ai "$repo" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
+      printf '%s' "$output"
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      log "summary 接口调用失败，${delay}s 后重试（${attempt}/${attempts}）：${repo}@${branch}#${pr_number}"
+      sleep "$delay"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 normalize_review_text() {
   local review_text="$1"
 
@@ -1170,6 +1298,7 @@ fallback_summary() {
   local first_line
   local severity=""
   local cleaned=""
+  local normalized=""
 
   issues="$(printf '%s\n' "$review_text" | grep -E 'P[0-5]' | head -n 5 || true)"
   if [[ -n "$issues" ]]; then
@@ -1179,12 +1308,29 @@ fallback_summary() {
     else
       severity="P1"
     fi
-    cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\\*\\*//g; s/!\\[[^]]*\\]\\([^)]*\\)//g')"
+    cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\*\*//g; s/!\[[^]]*\]\([^)]*\)//g')"
     printf '%s\t%s\t%s\n' "$severity" "$cleaned" ""
-  else
-    printf '%s\t%s\t%s\n' "NONE" "无 P0-P5 风险或审查未完成" ""
+    return 0
   fi
+
+  if review_has_no_issues "$review_text"; then
+    printf '%s\t%s\t%s\n' "INFO" "审查未发现风险项" ""
+    return 0
+  fi
+
+  normalized="$(normalize_review_text "$review_text")"
+  if [[ -n "$normalized" ]]; then
+    first_line="${normalized%%$'\n'*}"
+    if [[ -n "$first_line" ]]; then
+      cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\*\*//g; s/!\[[^]]*\]\([^)]*\)//g')"
+      printf '%s\t%s\t%s\n' "INFO" "$cleaned" ""
+      return 0
+    fi
+  fi
+
+  printf '%s\t%s\t%s\n' "INFO" "审查已完成，未标注 P0-P5" ""
 }
+
 
 build_run_file_from_prs() {
   local report_date="$1"
@@ -1217,10 +1363,6 @@ build_run_file_from_prs() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$gitlab_path" "$branch" "$gh_repo" "$pr_number" "$pr_url" >> "$RUN_FILE"
   done < "$ROOT_DIR/config/repos.txt"
 }
-
-if [[ ! -s "$RUN_FILE" ]]; then
-  build_run_file_from_prs "$REPORT_DATE"
-fi
 
 log_missing_prs() {
   local missing
@@ -1279,8 +1421,6 @@ PY
     done <<< "$missing"
   fi
 }
-
-log_missing_prs
 
 build_payload() {
   local title="$1"
@@ -1449,7 +1589,22 @@ case "${LARK_MESSAGE_TYPE:-card_v2}" in
 esac
 
 sent_any=0
-if [[ -s "$RUN_FILE" ]]; then
+for REPORT_DATE in "${REPORT_DATES[@]}"; do
+  RUN_FILE="$RUN_DIR/run-$REPORT_DATE.tsv"
+  if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+    if ! should_send_report_date "$REPORT_DATE"; then
+      log "报告日期不在发送窗口，跳过发送：$REPORT_DATE"
+      continue
+    fi
+  fi
+
+  if [[ ! -s "$RUN_FILE" ]]; then
+    build_run_file_from_prs "$REPORT_DATE"
+  fi
+
+  log_missing_prs
+
+  if [[ -s "$RUN_FILE" ]]; then
   while IFS=$'\t' read -r gitlab_path branch gh_repo pr_number pr_url; do
     [[ -z "$gitlab_path" ]] && continue
     if [[ -n "$TARGET_ENTRY" ]]; then
@@ -1467,6 +1622,11 @@ if [[ -s "$RUN_FILE" ]]; then
     report_label="$(cadence_title_label "$cadence")"
     report_marker="$(cadence_report_label "$cadence")"
     report_marker_text="已发送${report_marker}"
+
+    if [[ "$cadence" == "daily" && "$TODAY_DOW" -ge 6 && "$REPORT_DATE" == "$TODAY" ]]; then
+      log "周末日报延后到周一发送：$gitlab_path@$branch"
+      continue
+    fi
 
     if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
       if report_already_sent "$gh_repo" "$pr_number"; then
@@ -1501,11 +1661,8 @@ if [[ -s "$RUN_FILE" ]]; then
       fi
     fi
 
-    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
-      if ! review_contains_severity "$review_text"; then
-        log "审查未标注 P0-P5，跳过发送：$gitlab_path@$branch"
-        continue
-      fi
+    if ! review_contains_severity "$review_text"; then
+      log "审查未标注 P0-P5，继续发送：$gitlab_path@$branch"
     fi
 
     location_info="$(extract_location "$review_text")"
@@ -1537,13 +1694,25 @@ if [[ -s "$RUN_FILE" ]]; then
         issue_entries+=("${entry_location}"$'\037'"$snippet_block")
       fi
     fi
-    if summary_lines="$(summarize_review_with_ai "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
-      if [[ -n "$summary_lines" ]]; then
-        snippet_index=0
-        while IFS=$'\t' read -r severity summary; do
-          [[ -z "$severity" || "$severity" == "NONE" ]] && continue
-          entry_location=""
-          entry_snippet=""
+    if [[ -n "${CODEX_SUMMARY_API:-}" && -n "${CODEX_SUMMARY_TOKEN:-}" ]]; then
+      if ! summary_lines="$(summarize_review_with_retry "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location")"; then
+        add_summary_failure "${REPORT_DATE} ${gitlab_path}@${branch}#${pr_number}"
+        summary_lines=""
+      fi
+    fi
+    if [[ -z "$summary_lines" ]]; then
+      summary_lines="$(fallback_summary "$gitlab_path" "$branch" "$pr_number" "$review_text")"
+    fi
+    if [[ -n "$summary_lines" ]]; then
+      snippet_index=0
+      while IFS=$'\t' read -r severity summary; do
+        [[ -z "$severity" ]] && continue
+        [[ -z "$summary" ]] && continue
+        entry_location=""
+        entry_snippet=""
+        attach_snippet=0
+        if [[ "$severity" =~ ^[Pp][0-5]$ ]]; then
+          attach_snippet=1
           if [[ "$snippet_index" -lt "${#issue_entries[@]}" ]]; then
             entry="${issue_entries[$snippet_index]}"
             snippet_index=$((snippet_index + 1))
@@ -1555,16 +1724,20 @@ if [[ -s "$RUN_FILE" ]]; then
               entry_snippet=""
             fi
           fi
-          color="orange"
-          label="$severity"
-          case "$severity" in
-            P0) color="red" ;;
-            P1) color="orange" ;;
-            P2) color="yellow" ;;
-            P3) color="blue" ;;
-            P4) color="green" ;;
-            P5) color="neutral" ;;
-          esac
+        fi
+        color="blue"
+        label="$severity"
+        use_bullet=0
+        case "$severity" in
+          P0|p0) color="red"; use_bullet=1 ;;
+          P1|p1) color="orange"; use_bullet=1 ;;
+          P2|p2) color="yellow"; use_bullet=1 ;;
+          P3|p3) color="blue"; use_bullet=1 ;;
+          P4|p4) color="green"; use_bullet=1 ;;
+          P5|p5) color="neutral"; use_bullet=1 ;;
+          INFO|info|NONE|none) color="neutral"; label="提示" ;;
+        esac
+        if (( use_bullet )); then
           if [[ "$use_rich_tags" -eq 1 ]]; then
             line="- <text_tag color='$color'>$label</text_tag> $summary"
           else
@@ -1577,18 +1750,20 @@ if [[ -s "$RUN_FILE" ]]; then
             line_location="$location"
           fi
           if [[ -n "$line_location" ]]; then
-            line+="（"
-            if [[ -n "$line_location" ]]; then
-              line+="位置: $line_location"
-            fi
-            line+="）"
+            line+="（位置: ${line_location}）"
           fi
-          content+="$line"$'\n'
-          if [[ -n "$entry_snippet" ]]; then
-            content+="$entry_snippet"$'\n'
+        else
+          if [[ "$use_rich_tags" -eq 1 ]]; then
+            line="<text_tag color='$color'>$label</text_tag> $summary"
+          else
+            line="${label}：${summary}"
           fi
-        done <<< "$summary_lines"
-      fi
+        fi
+        content+="$line"$'\n'
+        if (( attach_snippet )) && [[ -n "$entry_snippet" ]]; then
+          content+="$entry_snippet"$'\n'
+        fi
+      done <<< "$summary_lines"
     fi
 
     if [[ -z "$(printf '%s' "$content" | tr -d '[:space:]')" ]]; then
@@ -1661,8 +1836,14 @@ if [[ -s "$RUN_FILE" ]]; then
     sent_any=1
   done < "$RUN_FILE"
 fi
+done
 
 if [[ "$sent_any" -eq 0 ]]; then
   log "无审查结果，跳过发送"
+fi
+
+send_summary_alert_dry || true
+
+if [[ "$sent_any" -eq 0 ]]; then
   exit 0
 fi
