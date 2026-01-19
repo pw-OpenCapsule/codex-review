@@ -38,11 +38,15 @@ AI 代码审计（每周/每日）
 - REVIEW_WAIT_SECONDS：最长等待秒数（到期仍发送）
 - REVIEW_POLL_INTERVAL：轮询间隔秒数
 - CODEX_REVIEW_AUTHOR：指定 Codex 账号 login 用于判断审查完成（不填则根据评论内容判断）
+- 日报在周六/周日不发送，周一补发周六/周日并发送周一日报
+- 审查无风险项且未标注 P0-P5 时不发送 Lark 与摘要
 
 报告内容润色（可选）
 - 使用 CODEX_SUMMARY_API 将 review 内容转为中文摘要（无链接、适合 Lark 阅读）
 - CODEX_SUMMARY_TOKEN：调用摘要 API 的 token（直接填 token，不需要 Bearer）
 - CODEX_SUMMARY_MODEL：摘要模型（默认 gpt-4o-mini）
+- SUMMARY_RETRY_COUNT：summary 调用失败的重试次数（默认 3）
+- SUMMARY_RETRY_DELAY_SECONDS：summary 重试间隔秒数（默认 2）
 - LARK_USER_MAP：Git 与 Lark 用户映射表（默认 config/lark_user_map.tsv）
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
 - SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
