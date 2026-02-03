@@ -134,18 +134,23 @@ send_summary_alert_dry() {
 
 usage() {
   cat <<'EOF'
-Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n]
+Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n] [--force|-f]
   REPORT_DATE          指定报告日期（默认今天）
   --dry, --dry-run, -n  发送到测试 webhook（不写 PR 标记）
+  --force, -f           强制重发（忽略“已发送”标记）
 EOF
 }
 
 DATE_INPUT=""
 LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
+FORCE_RESEND="${FORCE_RESEND:-0}"
 for arg in "$@"; do
   case "$arg" in
     --dry|--dry-run|-n)
       LARK_DRY_RUN=1
+      ;;
+    --force|-f)
+      FORCE_RESEND=1
       ;;
     --help|-h)
       usage
@@ -1064,6 +1069,9 @@ model = os.environ.get("CODEX_SUMMARY_MODEL", "gpt-4o-mini")
 review_text = os.environ.get("REVIEW_TEXT", "").strip()
 location = os.environ.get("LOCATION", "").strip()
 
+def log_err(message: str) -> None:
+    sys.stderr.write(message.rstrip() + "\n")
+
 def normalize(text: str) -> str:
     text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
     text = re.sub(r"(?mi)^To use Codex here,.*$", "", text)
@@ -1128,8 +1136,26 @@ req = urllib.request.Request(
 
 try:
     with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except Exception:
+        body = resp.read().decode("utf-8", "replace")
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", "replace")
+    log_err(f"summary api http error: {exc.code}")
+    if body:
+        log_err(body[:2000])
+    sys.exit(1)
+except urllib.error.URLError as exc:
+    log_err(f"summary api url error: {exc}")
+    sys.exit(1)
+except Exception as exc:
+    log_err(f"summary api error: {exc}")
+    sys.exit(1)
+
+try:
+    data = json.loads(body)
+except Exception as exc:
+    log_err(f"summary api json parse error: {exc}")
+    if body:
+        log_err(body[:2000])
     sys.exit(1)
 
 content = (
@@ -1140,6 +1166,7 @@ content = (
 )
 
 if not content:
+    log_err("summary api empty content")
     sys.exit(1)
 
 def extract_json(raw: str):
@@ -1165,10 +1192,13 @@ def has_zh(text: str) -> bool:
 
 parsed = extract_json(content)
 if not parsed:
+    log_err("summary api invalid json content")
+    log_err(content[:2000])
     sys.exit(1)
 
 issues = parsed.get("issues") or []
 if has_severity and not issues:
+    log_err("summary api returned empty issues with severity present")
     sys.exit(1)
 
 if issues and not any(has_zh((i.get("summary") or "")) for i in issues):
@@ -1231,7 +1261,7 @@ summarize_review_with_retry() {
   fi
 
   while (( attempt <= attempts )); do
-    if output="$(summarize_review_with_ai "$repo" "$branch" "$pr_number" "$review_text" "$location" 2>/dev/null)"; then
+    if output="$(summarize_review_with_ai "$repo" "$branch" "$pr_number" "$review_text" "$location")"; then
       printf '%s' "$output"
       return 0
     fi
@@ -1628,9 +1658,9 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
       continue
     fi
 
-    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
+    if [[ "${LARK_DRY_RUN:-0}" != "1" && "${FORCE_RESEND:-0}" != "1" ]]; then
       if report_already_sent "$gh_repo" "$pr_number"; then
-        log "$report_marker_text，跳过：$gitlab_path@$branch"
+        log "${report_marker_text}，跳过：$gitlab_path@$branch"
         continue
       fi
     fi
