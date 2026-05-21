@@ -436,6 +436,44 @@ for key, count in counts.most_common():
 PY
 }
 
+merge_author_tsv() {
+  local author_lines="$1"
+
+  AUTHOR_LINES="$author_lines" python3 - <<'PY'
+import os
+from collections import Counter
+
+raw = os.environ.get("AUTHOR_LINES", "")
+if not raw.strip():
+    raise SystemExit(1)
+
+counts = Counter()
+meta = {}
+for line in raw.splitlines():
+    parts = line.split("\t")
+    name = parts[0].strip() if parts else ""
+    email = parts[1].strip() if len(parts) > 1 else ""
+    raw_count = parts[2].strip() if len(parts) > 2 else "1"
+    try:
+        count = int(raw_count)
+    except ValueError:
+        count = 1
+    key = (email or name).strip().lower()
+    if not key:
+        continue
+    counts[key] += count
+    if key not in meta:
+        meta[key] = (name, email)
+
+if not counts:
+    raise SystemExit(1)
+
+for key, count in counts.most_common():
+    name, email = meta.get(key, ("", ""))
+    print(f"{name}\t{email}\t{count}")
+PY
+}
+
 resolve_lark_webhook() {
   if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
     if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
@@ -667,6 +705,7 @@ end = os.environ["END"]
 
 cmd = [
     "git", "-C", repo, "blame",
+    "-w", "-M", "-C",
     "--line-porcelain",
     "-L", f"{start},{end}",
     ref, "--", path
@@ -720,11 +759,14 @@ with open(path, "r", encoding="utf-8") as fh:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
+        if "\t" in line:
+            parts = line.split("\t", 1)
+        else:
+            parts = line.split(None, 1)
         if len(parts) < 2:
             continue
         git_key = parts[0].strip().lower()
-        lark_id = parts[1].strip()
+        lark_id = parts[1].split()[0].strip()
         if not lark_id:
             continue
         if email and email == git_key:
@@ -1037,6 +1079,72 @@ collect_issue_snippets() {
       printf '%s\037```%s\n%s\n```\0' "$location" "$lang" "$snippet"
     fi
   done <<< "$locations"
+}
+
+collect_issue_evidence() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local branch="$3"
+  local repo_path
+  local locations
+  local snippet
+  local snippet_block
+  local blame_authors
+  local responsible_line
+  local lang
+  local location
+
+  repo_path="$(repo_dir "$gh_repo")"
+  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
+  if [[ -z "$locations" ]]; then
+    return 0
+  fi
+
+  while IFS=$'\t' read -r commit path start end; do
+    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
+    location="${path}:${start}-${end}"
+    snippet_block=""
+    responsible_line=""
+
+    snippet="$(get_code_snippet "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
+    if [[ -n "$snippet" ]]; then
+      lang="$(code_lang "$path")"
+      snippet_block="$(printf '```%s\n%s\n```' "$lang" "$snippet")"
+    fi
+
+    blame_authors="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
+    if [[ -n "$blame_authors" ]]; then
+      responsible_line="$(format_mention_line "$blame_authors" "疑似责任人" || true)"
+    fi
+
+    printf '%s\037%s\037%s\0' "$location" "$snippet_block" "$responsible_line"
+  done <<< "$locations"
+}
+
+collect_issue_blame_authors() {
+  local gh_repo="$1"
+  local pr_number="$2"
+  local branch="$3"
+  local repo_path
+  local locations
+  local blame_authors
+  local all_authors=""
+
+  repo_path="$(repo_dir "$gh_repo")"
+  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
+  if [[ -z "$locations" ]]; then
+    return 1
+  fi
+
+  while IFS=$'\t' read -r commit path start end; do
+    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
+    blame_authors="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
+    if [[ -n "$blame_authors" ]]; then
+      all_authors+="$blame_authors"$'\n'
+    fi
+  done <<< "$locations"
+
+  merge_author_tsv "$all_authors"
 }
 summarize_review_with_ai() {
   local repo="$1"
@@ -1709,23 +1817,42 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
       repo_path="$(repo_dir "$gh_repo")"
     fi
 
-    content=""
-    summary_lines=""
-    issue_entries=()
-    while IFS= read -r -d '' entry; do
-      issue_entries+=("$entry")
-    done < <(collect_issue_snippets "$gh_repo" "$pr_number" "$branch")
-    if [[ "${#issue_entries[@]}" -eq 0 && -n "$location_commit" && -n "$location_path" ]]; then
-      fallback_snippet="$(get_code_snippet "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
-      if [[ -n "$fallback_snippet" ]]; then
-        lang="$(code_lang "$location_path")"
-        entry_location="${location_path}:${location_start}-${location_end}"
-        snippet_block="$(printf '```%s\n%s\n```' "$lang" "$fallback_snippet")"
-        issue_entries+=("${entry_location}"$'\037'"$snippet_block")
-      fi
-    fi
-    if [[ -n "${CODEX_SUMMARY_API:-}" && -n "${CODEX_SUMMARY_TOKEN:-}" ]]; then
-      if ! summary_lines="$(summarize_review_with_retry "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location")"; then
+	    content=""
+	    summary_lines=""
+	    responsible_block=""
+	    responsible_source=""
+	    blame_authors_tsv=""
+	    issue_entries=()
+	    while IFS= read -r -d '' entry; do
+	      issue_entries+=("$entry")
+	    done < <(collect_issue_evidence "$gh_repo" "$pr_number" "$branch")
+	    blame_authors_tsv="$(collect_issue_blame_authors "$gh_repo" "$pr_number" "$branch" || true)"
+	    if [[ "${#issue_entries[@]}" -eq 0 && -n "$location_commit" && -n "$location_path" ]]; then
+	      fallback_snippet="$(get_code_snippet "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
+	      fallback_blame_authors="$(get_blame_authors "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
+	      if [[ -n "$fallback_blame_authors" && -z "$blame_authors_tsv" ]]; then
+	        blame_authors_tsv="$(merge_author_tsv "$fallback_blame_authors" || true)"
+	      fi
+	      if [[ -n "$fallback_snippet" || -n "$fallback_blame_authors" ]]; then
+	        lang="$(code_lang "$location_path")"
+	        entry_location="${location_path}:${location_start}-${location_end}"
+	        snippet_block=""
+	        responsible_line=""
+	        if [[ -n "$fallback_snippet" ]]; then
+	          snippet_block="$(printf '```%s\n%s\n```' "$lang" "$fallback_snippet")"
+	        fi
+	        if [[ -n "$fallback_blame_authors" ]]; then
+	          responsible_line="$(format_mention_line "$fallback_blame_authors" "疑似责任人" || true)"
+	        fi
+	        issue_entries+=("${entry_location}"$'\037'"$snippet_block"$'\037'"$responsible_line")
+	      fi
+	    fi
+	    if [[ -n "$blame_authors_tsv" ]]; then
+	      responsible_block="$(format_mention_line "$blame_authors_tsv" "疑似责任人" || true)"
+	      responsible_source="review 行 blame"
+	    fi
+	    if [[ -n "${CODEX_SUMMARY_API:-}" && -n "${CODEX_SUMMARY_TOKEN:-}" ]]; then
+	      if ! summary_lines="$(summarize_review_with_retry "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location")"; then
         add_summary_failure "${REPORT_DATE} ${gitlab_path}@${branch}#${pr_number}"
         summary_lines=""
       fi
@@ -1738,20 +1865,25 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
       while IFS=$'\t' read -r severity summary; do
         [[ -z "$severity" ]] && continue
         [[ -z "$summary" ]] && continue
-        entry_location=""
-        entry_snippet=""
-        attach_snippet=0
-        if [[ "$severity" =~ ^[Pp][0-5]$ ]]; then
-          attach_snippet=1
-          if [[ "$snippet_index" -lt "${#issue_entries[@]}" ]]; then
-            entry="${issue_entries[$snippet_index]}"
-            snippet_index=$((snippet_index + 1))
-            entry_location="${entry%%$'\037'*}"
-            if [[ "$entry_location" != "$entry" ]]; then
-              entry_snippet="${entry#*$'\037'}"
-            else
-              entry_location=""
-              entry_snippet=""
+	        entry_location=""
+	        entry_snippet=""
+	        entry_responsible=""
+	        attach_snippet=0
+	        if [[ "$severity" =~ ^[Pp][0-5]$ ]]; then
+	          attach_snippet=1
+	          if [[ "$snippet_index" -lt "${#issue_entries[@]}" ]]; then
+	            entry="${issue_entries[$snippet_index]}"
+	            snippet_index=$((snippet_index + 1))
+	            entry_location="${entry%%$'\037'*}"
+	            if [[ "$entry_location" != "$entry" ]]; then
+	              entry_rest="${entry#*$'\037'}"
+	              entry_snippet="${entry_rest%%$'\037'*}"
+	              if [[ "$entry_rest" != "$entry_snippet" ]]; then
+	                entry_responsible="${entry_rest#*$'\037'}"
+	              fi
+	            else
+	              entry_location=""
+	              entry_snippet=""
             fi
           fi
         fi
@@ -1779,10 +1911,13 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
           elif [[ "${#issue_entries[@]}" -eq 0 ]]; then
             line_location="$location"
           fi
-          if [[ -n "$line_location" ]]; then
-            line+="（位置: ${line_location}）"
-          fi
-        else
+	          if [[ -n "$line_location" ]]; then
+	            line+="（位置: ${line_location}）"
+	          fi
+	          if [[ -n "$entry_responsible" ]]; then
+	            line+="（${entry_responsible}）"
+	          fi
+	        else
           if [[ "$use_rich_tags" -eq 1 ]]; then
             line="<text_tag color='$color'>$label</text_tag> $summary"
           else
@@ -1801,16 +1936,21 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
       continue
     fi
 
-    daily_commit_block=""
-    daily_authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
-    if [[ -n "$daily_authors_tsv" ]]; then
-      daily_commit_block="$(format_mention_line "$daily_authors_tsv" "提交人" || true)"
-    fi
+	    if [[ -z "$responsible_block" ]]; then
+	      daily_authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
+	      if [[ -n "$daily_authors_tsv" ]]; then
+	        responsible_block="$(format_mention_line "$daily_authors_tsv" "疑似责任人(按提交人兜底)" || true)"
+	        responsible_source="PR 提交人兜底"
+	      fi
+	    fi
 
-    final_content=""
-    if [[ -n "$daily_commit_block" ]]; then
-      final_content+="$daily_commit_block"
-    fi
+	    final_content=""
+	    if [[ -n "$responsible_block" ]]; then
+	      final_content+="$responsible_block"
+	      if [[ -n "$responsible_source" ]]; then
+	        final_content+="（依据: ${responsible_source}）"
+	      fi
+	    fi
     if [[ -n "$final_content" ]]; then
       final_content+=$'\n<br>\n<br>\n'
     fi
