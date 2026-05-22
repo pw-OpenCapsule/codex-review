@@ -4,17 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# shellcheck source=../config/settings.env
-source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
+load_settings "$ROOT_DIR"
 
 ensure_dirs
 
 mode="all"
 strategy="${GOGS_BRANCH_STRATEGY:-default}"
 write_mode="merge"
-output_path="$ROOT_DIR/config/repos.txt"
+output_path="$REPOS_FILE"
 dry_run=0
 orgs=()
 

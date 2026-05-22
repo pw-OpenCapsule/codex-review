@@ -4,10 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# shellcheck source=../config/settings.env
-source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
+load_settings "$ROOT_DIR"
 
 ensure_dirs
 
@@ -55,7 +54,7 @@ load_repo_cadences() {
     fi
 
     set_repo_cadence "$gitlab_path@$branch" "$cadence"
-  done < "$ROOT_DIR/config/repos.txt"
+  done < "$REPOS_FILE"
 }
 
 repo_cadence_for() {
@@ -1499,7 +1498,7 @@ build_run_file_from_prs() {
 
     pr_url="$(gh pr view --repo "$gh_repo" "$pr_number" --json url --jq '.url')"
     printf '%s\t%s\t%s\t%s\t%s\n' "$gitlab_path" "$branch" "$gh_repo" "$pr_number" "$pr_url" >> "$RUN_FILE"
-  done < "$ROOT_DIR/config/repos.txt"
+  done < "$REPOS_FILE"
 }
 
 log_missing_prs() {

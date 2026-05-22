@@ -6,10 +6,9 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 export GIT_TERMINAL_PROMPT=0
 
-# shellcheck source=../config/settings.env
-source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
+load_settings "$ROOT_DIR"
 
 ensure_dirs
 ensure_gh_auth
@@ -140,6 +139,6 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
 
   log "初始化完成：$gitlab_path@$branch"
   synced=$((synced + 1))
-done < "$ROOT_DIR/config/repos.txt"
+done < "$REPOS_FILE"
 
 log "完成：总计=$total 创建=$created 同步=$synced 失败=$failed"

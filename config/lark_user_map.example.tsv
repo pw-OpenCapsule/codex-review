@@ -1,0 +1,5 @@
+# git_identifier<TAB>lark_open_id<TAB>display_name
+# display_name is documentation only; scripts read the first two columns.
+#
+# alice@example.com	ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx	Alice
+# alice	ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx	Alice
