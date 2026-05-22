@@ -1,7 +1,30 @@
-AI 代码审计（每周/每日）
+# AI 代码审计（每周/每日）
 
 本仓库包含脚本与配置，用于对 GitHub 镜像仓库执行每日/每周 Codex Code Review usage
 （官方用量口径），并发送 Lark 报告。
+
+仓库地址：https://github.com/pw-OpenCapsule/codex-review
+
+> 当前仓库包含内部仓库清单、人员映射、飞书通知配置和历史凭据痕迹，默认应保持 private。
+> 不建议直接切换为 public；如需公开，先按下方“公开前检查”完成脱敏和历史清理。
+
+## 公开前检查
+
+当前状态：**不适合直接 public**。
+
+主要原因：
+- `config/settings.env` 是运行环境配置，可能包含真实 GitLab/Lark/summary API 凭据或内部域名。
+- `config/repos.txt` 包含内部项目路径、分支和项目命名信息。
+- `config/lark_user_map.tsv` 包含员工邮箱、飞书 open_id 和显示名，属于人员信息。
+- Git 历史中出现过 Lark webhook、GitLab token、内部 GitLab 域名等敏感信息；即使当前文件脱敏，public 后历史仍可被检索。
+- README、脚本和模板里包含内部流程、Lark/GitLab/GitHub 镜像约定，公开前需要确认是否可以外部披露。
+
+公开前至少需要完成：
+- 轮换已进入 Git 历史的 GitLab token、Lark webhook、summary API token 等所有相关凭据。
+- 将真实配置移出版本库，改用 `.env` 或部署环境变量；仓库只保留 `.env.example` / `settings.env.example`。
+- 从版本库移除或脱敏 `config/repos.txt` 与 `config/lark_user_map.tsv`，只保留示例文件。
+- 清理 Git 历史中的敏感内容；必要时重建一个干净 public 仓库，而不是直接把当前仓库改成 public。
+- 检查 GitHub Actions、cron、部署机脚本和本地 clone 的 remote，确认它们指向新的 private 仓库地址。
 
 命名规则
 - GitLab 仓路径：group/project
