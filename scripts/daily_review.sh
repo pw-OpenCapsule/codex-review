@@ -51,6 +51,7 @@ fi
 RUN_SENT_FILE="$RUN_DIR/run-$TODAY.sent"
 REVIEW_RANGE="${REVIEW_RANGE:-yesterday}"
 DAILY_REVIEW_RANGE="${DAILY_REVIEW_RANGE:-$REVIEW_RANGE}"
+INTERVAL_REVIEW_RANGE="${INTERVAL_REVIEW_RANGE:-incremental}"
 WEEKLY_REVIEW_RANGE="${WEEKLY_REVIEW_RANGE:-$REVIEW_RANGE}"
 WEEKLY_REVIEW_DOW="${WEEKLY_REVIEW_DOW:-}"
 LOG_YESTERDAY_COMMITS="${LOG_YESTERDAY_COMMITS:-1}"
@@ -123,6 +124,9 @@ review_range_for_cadence() {
     daily)
       printf '%s' "$DAILY_REVIEW_RANGE"
       ;;
+    every3d|every5d)
+      printf '%s' "$INTERVAL_REVIEW_RANGE"
+      ;;
     weekly)
       printf '%s' "$WEEKLY_REVIEW_RANGE"
       ;;
@@ -144,16 +148,106 @@ ensure_weekly_dow() {
 
 should_run_cadence() {
   local cadence="$1"
+  local gitlab_path="${2:-}"
+  local branch="${3:-}"
+  local interval_days=""
+  local last_file=""
+  local last_date=""
+  local elapsed=""
 
-  if [[ "$cadence" != "weekly" ]]; then
+  if [[ "${FORCE_REVIEW:-0}" == "1" ]]; then
     return 0
   fi
 
-  if [[ -z "$WEEKLY_REVIEW_DOW" ]]; then
+  case "$cadence" in
+    manual)
+      return 1
+      ;;
+    daily)
+      return 0
+      ;;
+    every3d)
+      interval_days=3
+      ;;
+    every5d)
+      interval_days=5
+      ;;
+    weekly)
+      if [[ -z "$WEEKLY_REVIEW_DOW" ]]; then
+        return 0
+      fi
+
+      [[ "$TODAY_DOW" == "$WEEKLY_REVIEW_DOW" ]]
+      return
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if [[ "$TODAY_DOW" -ge 6 ]]; then
+    return 1
+  fi
+
+  last_file="$(cadence_state_file "$gitlab_path" "$branch" "$cadence")"
+  if [[ ! -f "$last_file" ]]; then
     return 0
   fi
 
-  [[ "$TODAY_DOW" == "$WEEKLY_REVIEW_DOW" ]]
+  last_date="$(cat "$last_file")"
+  elapsed="$(workdays_between "$last_date" "$TODAY" || printf '')"
+  [[ -n "$elapsed" && "$elapsed" -ge "$interval_days" ]]
+}
+
+cadence_state_file() {
+  local gitlab_path="$1"
+  local branch="$2"
+  local cadence="$3"
+  local key="${gitlab_path//\//__}__${branch//\//__}__${cadence}"
+  printf '%s/%s.cadence' "$STATE_DIR" "$key"
+}
+
+mark_cadence_checked() {
+  local gitlab_path="$1"
+  local branch="$2"
+  local cadence="$3"
+
+  case "$cadence" in
+    every3d|every5d)
+      if (( ! DRY_RUN )); then
+        printf '%s\n' "$TODAY" > "$(cadence_state_file "$gitlab_path" "$branch" "$cadence")"
+      fi
+      ;;
+  esac
+}
+
+workdays_between() {
+  local start="$1"
+  local end="$2"
+
+  START_DATE="$start" END_DATE="$end" TZ_NAME="$TZ" python3 - <<'PY'
+import datetime
+import os
+import sys
+
+try:
+    start = datetime.date.fromisoformat(os.environ["START_DATE"])
+    end = datetime.date.fromisoformat(os.environ["END_DATE"])
+except ValueError:
+    raise SystemExit(1)
+
+if end <= start:
+    print(0)
+    raise SystemExit(0)
+
+days = 0
+current = start
+while current < end:
+    current += datetime.timedelta(days=1)
+    if current.weekday() < 5:
+        days += 1
+print(days)
+PY
 }
 
 ensure_weekly_dow
@@ -440,8 +534,18 @@ collect_queue() {
       branch="$DEFAULT_BRANCH"
     fi
 
-    if ! should_run_cadence "$cadence"; then
-      log "$gitlab_path@$branch 每周审计仅在周$WEEKLY_REVIEW_DOW 运行，跳过"
+    if ! should_run_cadence "$cadence" "$gitlab_path" "$branch"; then
+      case "$cadence" in
+        manual)
+          log "$gitlab_path@$branch 为手动审计，跳过"
+          ;;
+        every3d|every5d)
+          log "$gitlab_path@$branch 频率=$cadence 未到工作日间隔，跳过"
+          ;;
+        weekly)
+          log "$gitlab_path@$branch 每周审计仅在周$WEEKLY_REVIEW_DOW 运行，跳过"
+          ;;
+      esac
       continue
     fi
 
@@ -535,6 +639,7 @@ collect_queue() {
       else
         log "$gitlab_path@$branch 无变更"
       fi
+      mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
       continue
     fi
 
@@ -781,6 +886,7 @@ process_queue() {
     if [[ "$pr_state" != "OPEN" ]]; then
       log "拉取请求 $pr_number 状态为 $pr_state，跳过评论"
       printf '%s\n' "$head_sha" > "$(state_file "$gitlab_path" "$branch")"
+      mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
       continue
     fi
 
@@ -789,6 +895,7 @@ process_queue() {
     log "PR 已创建/复用：$pr_url"
 
     printf '%s\n' "$head_sha" > "$(state_file "$gitlab_path" "$branch")"
+    mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
     printf '%s\t%s\t%s\t%s\t%s\n' "$gitlab_path" "$branch" "$gh_repo" "$pr_number" "$pr_url" >> "$RUN_FILE_TMP"
 
     count=$((count + 1))
