@@ -36,10 +36,17 @@ cp config/repos.example.txt config/repos.txt
 cp config/lark_user_map.example.tsv config/lark_user_map.tsv
 ```
 
-生产环境建议使用独立 private 配置仓库或服务器配置目录同步真实配置，不建议用 public 仓库的 submodule 管理密钥：
+生产环境使用独立 private 配置仓库同步真实配置：
+
+- 代码仓库：https://github.com/pw-OpenCapsule/codex-review
+- 配置仓库：https://github.com/pw-OpenCapsule/codex-review-config
+
+不建议用 public 仓库的 submodule 管理密钥；用 private 配置仓库 + 环境变量路径更清晰。
 
 ```bash
-# 推荐：私有配置仓库拉到服务器本地，再用环境变量指向它。
+git clone https://github.com/pw-OpenCapsule/codex-review.git /opt/codex-review
+git clone https://github.com/pw-OpenCapsule/codex-review-config.git /etc/codex-review
+
 export CODEX_REVIEW_SETTINGS=/etc/codex-review/settings.env
 export REPOS_FILE=/etc/codex-review/repos.txt
 export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
