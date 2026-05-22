@@ -101,12 +101,25 @@ sync_from_gitlab() {
 total=0
 created=0
 synced=0
+skipped=0
 failed=0
 
 while IFS= read -r raw || [[ -n "$raw" ]]; do
   parsed="$(parse_repo_line "$raw" || true)"
   [[ -z "$parsed" ]] && continue
-  IFS=$'\t' read -r repo_spec _ <<< "$parsed"
+  IFS=$'\t' read -r repo_spec cadence_raw <<< "$parsed"
+
+  if ! cadence="$(normalize_cadence "$cadence_raw")"; then
+    log "无效审计频率，跳过：$repo_spec $cadence_raw"
+    failed=$((failed + 1))
+    continue
+  fi
+
+  if [[ "$cadence" == "manual" ]]; then
+    log "手动审计项目，跳过初始化：$repo_spec"
+    skipped=$((skipped + 1))
+    continue
+  fi
 
   total=$((total + 1))
   gitlab_path="${repo_spec%@*}"
@@ -141,4 +154,4 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   synced=$((synced + 1))
 done < "$REPOS_FILE"
 
-log "完成：总计=$total 创建=$created 同步=$synced 失败=$failed"
+log "完成：总计=$total 创建=$created 同步=$synced 跳过=$skipped 失败=$failed"
