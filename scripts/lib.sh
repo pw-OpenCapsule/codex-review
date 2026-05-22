@@ -143,6 +143,18 @@ normalize_cadence() {
       printf 'daily'
       return 0
       ;;
+    every3d|3d|third-day)
+      printf 'every3d'
+      return 0
+      ;;
+    every5d|5d|fifth-day)
+      printf 'every5d'
+      return 0
+      ;;
+    manual|skip|none|off)
+      printf 'manual'
+      return 0
+      ;;
     *)
       return 1
       ;;
@@ -156,8 +168,17 @@ cadence_title_label() {
     daily)
       printf '每日'
       ;;
+    every3d)
+      printf '每3工作日'
+      ;;
+    every5d)
+      printf '每5工作日'
+      ;;
     weekly)
       printf '每周'
+      ;;
+    manual)
+      printf '手动'
       ;;
     *)
       printf '每周'
@@ -172,8 +193,17 @@ cadence_report_label() {
     daily)
       printf '日报'
       ;;
+    every3d)
+      printf '3日节奏报告'
+      ;;
+    every5d)
+      printf '5日节奏报告'
+      ;;
     weekly)
       printf '周报'
+      ;;
+    manual)
+      printf '手动报告'
       ;;
     *)
       printf '周报'

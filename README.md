@@ -74,7 +74,7 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 7) 运行 scripts/send_lark_report.sh
 
 定时任务示例（东京）
-- 每日运行（daily/weekly 混合）：0 8 * * * /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
+- 每日运行（脚本内部按 daily/every3d/every5d/weekly/manual 节奏筛选）：0 8 * * * /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
 - 仅每周运行：0 8 * * 1 /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
 
 无人值守建议
@@ -124,6 +124,7 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 - LARK_MESSAGE_TYPE（post 或 interactive）
 - REVIEW_RANGE（yesterday 或 incremental，默认 yesterday；周更建议 incremental）
 - DAILY_REVIEW_RANGE（默认 yesterday）
+- INTERVAL_REVIEW_RANGE（every3d/every5d 使用，默认 incremental）
 - WEEKLY_REVIEW_RANGE（默认 incremental）
 - WEEKLY_REVIEW_DOW（可选，1-7，周一=1；仅 weekly 使用）
 - LOG_YESTERDAY_COMMITS（默认 1，打印昨日提交摘要）
@@ -150,8 +151,10 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 - templates/AGENTS.md：放在每个镜像仓库根目录
 
 白名单格式
-- group/project@branch [daily|weekly]
+- group/project@branch [daily|every3d|every5d|weekly|manual]
 - 不写分支时默认使用 DEFAULT_BRANCH
+- `every3d` / `every5d` 按工作日间隔计算，周六/周日自动跳过；日本节假日不内置判断。
+- `manual` 自动任务跳过，配合 FORCE_REVIEW 手动触发。
 
 GitLab 鉴权格式
 - GITLAB_AUTH 形如 user:token
