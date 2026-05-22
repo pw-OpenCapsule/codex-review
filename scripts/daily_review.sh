@@ -6,10 +6,9 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 export GIT_TERMINAL_PROMPT=0
 
-# shellcheck source=../config/settings.env
-source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
+load_settings "$ROOT_DIR"
 
 usage() {
   cat <<'EOF'
@@ -542,7 +541,7 @@ collect_queue() {
     read -r score loc risk < <(compute_score "$dir" "$base_sha" "$head_sha")
     log "加入队列 $gitlab_path@$branch 频率=$cadence 评分=$score 行数=$loc 风险文件=$risk"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$score" "$gitlab_path" "$branch" "$base_sha" "$head_sha" "$cadence" >> "$QUEUE_FILE"
-  done < "$ROOT_DIR/config/repos.txt"
+done < "$REPOS_FILE"
 }
 
 create_or_find_pr() {

@@ -5,3 +5,8 @@
 .DS_Store
 .runtime/
 repos.txt.back
+
+# Deployment-local configuration. Keep real values out of Git.
+/config/settings.env
+/config/repos.txt
+/config/lark_user_map.tsv

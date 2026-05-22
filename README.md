@@ -5,26 +5,47 @@
 
 仓库地址：https://github.com/pw-OpenCapsule/codex-review
 
-> 当前仓库包含内部仓库清单、人员映射、飞书通知配置和历史凭据痕迹，默认应保持 private。
-> 不建议直接切换为 public；如需公开，先按下方“公开前检查”完成脱敏和历史清理。
+> 代码仓库只保存脚本和示例配置。真实仓库清单、人员映射、token、webhook 等运行配置不进 Git。
 
 ## 公开前检查
 
-当前状态：**不适合直接 public**。
+目标状态：代码仓库可以公开，真实配置保持 private。
 
-主要原因：
-- `config/settings.env` 是运行环境配置，可能包含真实 GitLab/Lark/summary API 凭据或内部域名。
-- `config/repos.txt` 包含内部项目路径、分支和项目命名信息。
-- `config/lark_user_map.tsv` 包含员工邮箱、飞书 open_id 和显示名，属于人员信息。
-- Git 历史中出现过 Lark webhook、GitLab token、内部 GitLab 域名等敏感信息；即使当前文件脱敏，public 后历史仍可被检索。
-- README、脚本和模板里包含内部流程、Lark/GitLab/GitHub 镜像约定，公开前需要确认是否可以外部披露。
+公开前必须确认：
+- Git 历史已经清理，不包含真实 `config/settings.env`、`config/repos.txt`、`config/lark_user_map.tsv`。
+- 已轮换历史中出现过的 GitLab token、Lark webhook、summary API token 等凭据。
+- GitHub Actions、cron、部署机脚本和本地 clone 的 remote 已指向正确仓库。
 
-公开前至少需要完成：
-- 轮换已进入 Git 历史的 GitLab token、Lark webhook、summary API token 等所有相关凭据。
-- 将真实配置移出版本库，改用 `.env` 或部署环境变量；仓库只保留 `.env.example` / `settings.env.example`。
-- 从版本库移除或脱敏 `config/repos.txt` 与 `config/lark_user_map.tsv`，只保留示例文件。
-- 清理 Git 历史中的敏感内容；必要时重建一个干净 public 仓库，而不是直接把当前仓库改成 public。
-- 检查 GitHub Actions、cron、部署机脚本和本地 clone 的 remote，确认它们指向新的 private 仓库地址。
+## 配置管理
+
+真实配置文件被 `.gitignore` 忽略：
+- `config/settings.env`：运行配置、token、webhook、内部域名
+- `config/repos.txt`：待审计仓库白名单
+- `config/lark_user_map.tsv`：Git author 与 Lark 用户映射
+
+仓库只保留示例文件：
+- `config/settings.env.example`
+- `config/repos.example.txt`
+- `config/lark_user_map.example.tsv`
+
+初始化本地配置：
+
+```bash
+cp config/settings.env.example config/settings.env
+cp config/repos.example.txt config/repos.txt
+cp config/lark_user_map.example.tsv config/lark_user_map.tsv
+```
+
+生产环境建议使用独立 private 配置仓库或服务器配置目录同步真实配置，不建议用 public 仓库的 submodule 管理密钥：
+
+```bash
+# 推荐：私有配置仓库拉到服务器本地，再用环境变量指向它。
+export CODEX_REVIEW_SETTINGS=/etc/codex-review/settings.env
+export REPOS_FILE=/etc/codex-review/repos.txt
+export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
+```
+
+也可以把 private 配置仓库同步到本仓库的 `config/` 目录；这些真实文件已被 Git 忽略，不会被误提交。
 
 命名规则
 - GitLab 仓路径：group/project
@@ -37,12 +58,13 @@
   - 无人值守建议配置 GH_TOKEN/GITHUB_TOKEN，并运行一次 gh auth setup-git
 
 快速开始
-1) 编辑 config/settings.env
-2) 编辑 config/repos.txt（支持分支）
-3) （可选）首次运行 scripts/init_repos.sh（仅建仓与同步，不创建 PR / 评论）
-4) （可选）运行 scripts/sync_gogs_repos.sh（从 Gogs 同步仓库列表）
-5) 运行 scripts/daily_review.sh
-6) 运行 scripts/send_lark_report.sh
+1) 从 `config/*.example.*` 复制出本地真实配置
+2) 编辑 `config/settings.env`
+3) 编辑 `config/repos.txt`（支持分支）
+4) （可选）首次运行 scripts/init_repos.sh（仅建仓与同步，不创建 PR / 评论）
+5) （可选）运行 scripts/sync_gogs_repos.sh（从 Gogs 同步仓库列表）
+6) 运行 scripts/daily_review.sh
+7) 运行 scripts/send_lark_report.sh
 
 定时任务示例（东京）
 - 每日运行（daily/weekly 混合）：0 8 * * * /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
@@ -71,6 +93,8 @@
 - SUMMARY_RETRY_COUNT：summary 调用失败的重试次数（默认 3）
 - SUMMARY_RETRY_DELAY_SECONDS：summary 重试间隔秒数（默认 2）
 - LARK_USER_MAP：Git 与 Lark 用户映射表（默认 config/lark_user_map.tsv）
+- REPOS_FILE：仓库白名单路径（默认 config/repos.txt）
+- CODEX_REVIEW_SETTINGS：运行配置路径（默认 config/settings.env）
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
 - SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
 
@@ -106,12 +130,15 @@
 - MAX_REVIEWS_PER_RUN（0 表示不限制）
 
 文件说明
-- config/settings.env：运行配置
-- config/repos.txt：GitLab 仓白名单（支持分支）
-- config/lark_user_map.tsv：Git 与 Lark 用户映射表
+- config/settings.env.example：运行配置示例
+- config/repos.example.txt：GitLab 仓白名单示例（支持分支）
+- config/lark_user_map.example.tsv：Git 与 Lark 用户映射表示例
+- config/settings.env：本地真实运行配置，已忽略
+- config/repos.txt：本地真实仓白名单，已忽略
+- config/lark_user_map.tsv：本地真实用户映射，已忽略
 - scripts/daily_review.sh：按 daily/weekly 配置创建拉取请求并触发 Codex 审查
 - scripts/init_repos.sh：首次建仓与同步（不创建 PR / 评论）
-- scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 config/repos.txt
+- scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 REPOS_FILE
 - scripts/send_lark_report.sh：发送 Lark 报告
 - templates/AGENTS.md：放在每个镜像仓库根目录
 

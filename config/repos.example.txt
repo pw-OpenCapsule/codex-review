@@ -1,0 +1,8 @@
+# One repository per line:
+# group/project@branch [daily|weekly]
+#
+# Branch is optional and defaults to DEFAULT_BRANCH.
+# Cadence is optional and defaults to weekly.
+#
+# platform/auth-service@main daily
+# platform/payment-core@release weekly

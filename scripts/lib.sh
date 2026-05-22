@@ -27,6 +27,33 @@ load_dotenv() {
   fi
 }
 
+load_settings() {
+  local root="${1:-}"
+  local settings_path
+
+  if [[ -z "$root" ]]; then
+    die "load_settings requires repository root"
+  fi
+
+  settings_path="${CODEX_REVIEW_SETTINGS:-$root/config/settings.env}"
+  if [[ ! -f "$settings_path" ]]; then
+    die "配置文件不存在：$settings_path。请复制 config/settings.env.example，或设置 CODEX_REVIEW_SETTINGS 指向私有配置文件。"
+  fi
+
+  set -a
+  set +u
+  # shellcheck source=/dev/null
+  source "$settings_path"
+  set -u
+  set +a
+
+  # Let deployment-local .env override settings.env when both exist.
+  load_dotenv "$root"
+
+  REPOS_FILE="${REPOS_FILE:-$root/config/repos.txt}"
+  LARK_USER_MAP="${LARK_USER_MAP:-$root/config/lark_user_map.tsv}"
+}
+
 ensure_dirs() {
   mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR"
 }
