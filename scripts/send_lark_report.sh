@@ -161,6 +161,7 @@ EOF
 DATE_INPUT=""
 LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
 FORCE_RESEND="${FORCE_RESEND:-0}"
+declare -a ISSUES_FOR_MEEGLE=()
 for arg in "$@"; do
   case "$arg" in
     --dry|--dry-run|-n)
@@ -1170,9 +1171,35 @@ summarize_review_with_ai() {
   local review_text="$4"
   local location="$5"
 
-  if [[ -z "${CODEX_SUMMARY_API:-}" || -z "${CODEX_SUMMARY_TOKEN:-}" ]]; then
+  local codex_bin="${CODEX_EXEC_BIN:-codex}"
+  if ! command -v "$codex_bin" >/dev/null 2>&1; then
     return 1
   fi
+
+  local workdir="${WORKDIR:-}/$(basename "$repo")"
+  [[ -d "$workdir" ]] || workdir="${WORKDIR:-}/$repo"
+  if [[ ! -d "$workdir" ]]; then
+    log "codex_review: 镜像目录不存在 $workdir，跳过"
+    return 1
+  fi
+
+  local out
+  if ! out="$(call_codex_review "$(basename "$repo")" "$branch" "$pr_number" "HEAD" "$workdir" "$review_text" 2>/dev/null)"; then
+    return 1
+  fi
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# --- legacy python inline (replaced by call_codex_review above) ---
+_summarize_review_with_ai_legacy_DISABLED() {
+  local repo="$1"
+  local branch="$2"
+  local pr_number="$3"
+  local review_text="$4"
+  local location="$5"
 
   REPO_NAME="$repo" BRANCH_NAME="$branch" PR_NUMBER="$pr_number" REVIEW_TEXT="$review_text" LOCATION="$location" \
   CODEX_SUMMARY_API="$CODEX_SUMMARY_API" CODEX_SUMMARY_TOKEN="$CODEX_SUMMARY_TOKEN" CODEX_SUMMARY_MODEL="${CODEX_SUMMARY_MODEL:-gpt-4o-mini}" \
@@ -1761,6 +1788,7 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
 
   if [[ -s "$RUN_FILE" ]]; then
   while IFS=$'\t' read -r gitlab_path branch gh_repo pr_number pr_url; do
+    ISSUES_FOR_MEEGLE=()
     [[ -z "$gitlab_path" ]] && continue
     if [[ -n "$TARGET_ENTRY" ]]; then
       target_path="${TARGET_ENTRY%@*}"
@@ -1868,7 +1896,7 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
 	      responsible_block="$(format_mention_line "$blame_authors_tsv" "疑似责任人" || true)"
 	      responsible_source="review 行 blame"
 	    fi
-	    if [[ -n "${CODEX_SUMMARY_API:-}" && -n "${CODEX_SUMMARY_TOKEN:-}" ]]; then
+	    if command -v "${CODEX_EXEC_BIN:-codex}" >/dev/null 2>&1; then
 	      if ! summary_lines="$(summarize_review_with_retry "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location")"; then
         add_summary_failure "${REPORT_DATE} ${gitlab_path}@${branch}#${pr_number}"
         summary_lines=""
@@ -1879,7 +1907,7 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
     fi
     if [[ -n "$summary_lines" ]]; then
       snippet_index=0
-      while IFS=$'\t' read -r severity summary; do
+      while IFS=$'\t' read -r severity summary file line_start line_end evidence; do
         [[ -z "$severity" ]] && continue
         [[ -z "$summary" ]] && continue
 	        entry_location=""
@@ -1940,6 +1968,28 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
           else
             line="${label}：${summary}"
           fi
+        fi
+        if [[ -n "$file" && "${line_start:-0}" != "0" ]]; then
+          pr_url_safe="${pr_url:-https://github.com/${GITHUB_ORG}/$(basename "$gitlab_path")/pull/${pr_number}}"
+          issue_json=$(python3 -c '
+import json, os
+print(json.dumps({
+  "severity": os.environ["S_SEV"],
+  "summary":  os.environ["S_SUMMARY"],
+  "file":     os.environ["S_FILE"],
+  "line_start": int(os.environ["S_LS"]),
+  "line_end":   int(os.environ["S_LE"]),
+  "evidence": os.environ["S_EV"],
+  "original": os.environ["S_ORIG"],
+  "repo":     os.environ["S_REPO"],
+  "pr":       os.environ["S_PR"],
+  "pr_url":   os.environ["S_PRURL"],
+}, ensure_ascii=False))
+' S_SEV="$severity" S_SUMMARY="$summary" S_FILE="$file" \
+  S_LS="$line_start" S_LE="$line_end" S_EV="$evidence" \
+  S_ORIG="$review_text" S_REPO="$(basename "$gitlab_path")" \
+  S_PR="$pr_number" S_PRURL="$pr_url_safe")
+          ISSUES_FOR_MEEGLE+=("$issue_json")
         fi
         content+="$line"$'\n'
         if (( attach_snippet )) && [[ -n "$entry_snippet" ]]; then
@@ -2024,6 +2074,9 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
     else
       log "DRY_RUN=1，已发送测试${report_marker}：$gitlab_path@$branch"
     fi
+    mirror_dir="${WORKDIR}/$(basename "$gitlab_path")"
+    [[ -d "$mirror_dir" ]] || mirror_dir="$WORKDIR/$gitlab_path"
+    create_meegle_bugs "$mirror_dir" || log "meegle batch 含错误，看 ${STATE_DIR}/meegle-created.log"
     sent_any=1
   done < "$RUN_FILE"
 fi
