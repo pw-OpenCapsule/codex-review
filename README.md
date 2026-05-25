@@ -129,6 +129,9 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 - WEEKLY_REVIEW_DOW（可选，1-7，周一=1；仅 weekly 使用）
 - LOG_YESTERDAY_COMMITS（默认 1，打印昨日提交摘要）
 - YESTERDAY_LOG_LIMIT（默认 20，最多打印多少条）
+- REVIEW_DASHBOARD_URL（可选，飞书报告末尾追加的状态页链接）
+- AUTO_BUILD_REVIEW_DASHBOARD（可选，发送报告后刷新状态页，默认 0）
+- REVIEW_DASHBOARD_DAYS（状态页默认历史天数，默认 30）
 - WORKDIR, STATE_DIR, RUN_DIR
 - GITLAB_HOST, GITLAB_PROTOCOL, GITLAB_AUTH, SYNC_FROM_GITLAB
 - LARK_WEBHOOK_URL
@@ -159,6 +162,7 @@ Review 状态页
   - `$RUN_DIR/review-dashboard.html`
   - `$RUN_DIR/review-dashboard.json`
 - 页面展示已处理、未处理、等待审查、是否已发送群消息，并支持前端搜索/筛选。
+- 设置 `REVIEW_DASHBOARD_URL` 后，飞书报告末尾会附带状态页入口；设置 `AUTO_BUILD_REVIEW_DASHBOARD=1` 后，发送报告结束会自动刷新页面。
 
 白名单格式
 - group/project@branch [daily|every3d|every5d|weekly|manual]

@@ -131,6 +131,24 @@ send_summary_alert_dry() {
   log "summary 告警已发送（dry webhook）"
 }
 
+refresh_review_dashboard() {
+  if [[ "${AUTO_BUILD_REVIEW_DASHBOARD:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ ! -x "$SCRIPT_DIR/build_review_dashboard.sh" ]]; then
+    log "状态页脚本不存在或不可执行，跳过刷新"
+    return 0
+  fi
+
+  local dashboard_days="${REVIEW_DASHBOARD_DAYS:-30}"
+  if "$SCRIPT_DIR/build_review_dashboard.sh" --days "$dashboard_days" >/dev/null; then
+    log "已刷新 Review 状态页"
+  else
+    log "Review 状态页刷新失败"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n] [--force|-f]
@@ -1955,6 +1973,10 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
     fi
     final_content+="【发现】"$'\n\n'
     final_content+="$content"
+    if [[ -n "${REVIEW_DASHBOARD_URL:-}" ]]; then
+      final_content+=$'\n<br>\n<br>\n'
+      final_content+="Review 状态页：${REVIEW_DASHBOARD_URL}"
+    fi
 
     title="${report_label}代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
     payload="$(build_payload "$title" "$final_content")"
@@ -2016,3 +2038,5 @@ send_summary_alert_dry || true
 if [[ "$sent_any" -eq 0 ]]; then
   exit 0
 fi
+
+refresh_review_dashboard || true
