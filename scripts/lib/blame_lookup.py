@@ -14,6 +14,8 @@ def main():
     ap.add_argument("--file", required=True)
     ap.add_argument("--line-start", type=int, required=True)
     ap.add_argument("--line-end", type=int, required=True)
+    ap.add_argument("--sha", default="",
+                    help="blame at this revision instead of HEAD; falls back to HEAD if invalid")
     ap.add_argument("--user-map", default="")
     ap.add_argument("--default-meegle", default="")
     args = ap.parse_args()
@@ -22,10 +24,24 @@ def main():
     line_end = max(line_start, args.line_end)
     rel = args.file
 
+    cmd = ["git", "blame", "--porcelain", f"-L{line_start},{line_end}"]
+    sha = args.sha.strip()
+    if sha:
+        # Verify the SHA is reachable; fall back to HEAD if not
+        try:
+            subprocess.check_output(
+                ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                cwd=args.workdir, stderr=subprocess.DEVNULL, timeout=5,
+            )
+            cmd.append(sha)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                FileNotFoundError):
+            pass  # fall through to HEAD
+    cmd += ["--", rel]
+
     try:
         out = subprocess.check_output(
-            ["git", "blame", "--porcelain",
-             f"-L{line_start},{line_end}", "--", rel],
+            cmd,
             cwd=args.workdir, stderr=subprocess.DEVNULL, text=True,
             timeout=15,
         )

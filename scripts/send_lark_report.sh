@@ -1184,7 +1184,8 @@ summarize_review_with_ai() {
   fi
 
   local out
-  if ! out="$(call_codex_review "$(basename "$repo")" "$branch" "$pr_number" "HEAD" "$workdir" "$review_text" 2>/dev/null)"; then
+  local sha_for_codex="${pr_head_sha:-HEAD}"
+  if ! out="$(call_codex_review "$(basename "$repo")" "$branch" "$pr_number" "$sha_for_codex" "$workdir" "$review_text" 2>/dev/null)"; then
     return 1
   fi
   if [[ -z "$out" ]]; then
@@ -1790,6 +1791,13 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
   while IFS=$'\t' read -r gitlab_path branch gh_repo pr_number pr_url; do
     ISSUES_FOR_MEEGLE=()
     [[ -z "$gitlab_path" ]] && continue
+    pr_head_sha="$(gh pr view --repo "$gh_repo" "$pr_number" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo '')"
+    if [[ -n "$pr_head_sha" ]]; then
+      mirror_for_fetch="$(repo_dir "$gh_repo")"
+      if [[ -d "$mirror_for_fetch" ]]; then
+        git -C "$mirror_for_fetch" fetch origin "pull/$pr_number/head:refs/audit/pr/$pr_number" 2>/dev/null || true
+      fi
+    fi
     if [[ -n "$TARGET_ENTRY" ]]; then
       target_path="${TARGET_ENTRY%@*}"
       target_branch="${TARGET_ENTRY#*@}"
@@ -1975,6 +1983,7 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
             S_LS="$line_start" S_LE="$line_end" S_EV="$evidence" \
             S_ORIG="$review_text" S_REPO="$(basename "$gitlab_path")" \
             S_PR="$pr_number" S_PRURL="$pr_url_safe" \
+            S_SHA="${pr_head_sha:-}" \
             python3 -c '
 import json, os
 print(json.dumps({
@@ -1988,6 +1997,7 @@ print(json.dumps({
   "repo":     os.environ["S_REPO"],
   "pr":       os.environ["S_PR"],
   "pr_url":   os.environ["S_PRURL"],
+  "head_sha": os.environ["S_SHA"],
 }, ensure_ascii=False))
 ')
           ISSUES_FOR_MEEGLE+=("$issue_json")

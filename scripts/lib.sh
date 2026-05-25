@@ -299,11 +299,12 @@ create_meegle_bugs() {
   local issue_json
   for issue_json in "${ISSUES_FOR_MEEGLE[@]}"; do
     [[ -z "$issue_json" ]] && continue
-    local file line_start line_end summary
+    local file line_start line_end summary head_sha
     file=$(printf '%s' "$issue_json"       | python3 -c 'import json,sys;print(json.load(sys.stdin).get("file",""))')
     line_start=$(printf '%s' "$issue_json" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("line_start",0))')
     line_end=$(printf '%s' "$issue_json"   | python3 -c 'import json,sys;print(json.load(sys.stdin).get("line_end",0))')
     summary=$(printf '%s' "$issue_json"    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("summary",""))')
+    head_sha=$(printf '%s' "$issue_json"   | python3 -c 'import json,sys;print(json.load(sys.stdin).get("head_sha",""))')
 
     if [[ -z "$file" || "$line_start" == "0" ]]; then
       log "meegle: 跳过 file/line 缺失的 issue: $summary"
@@ -314,6 +315,7 @@ create_meegle_bugs() {
     blame_json=$(python3 "$script_dir/lib/blame_lookup.py" \
       --workdir "$workdir" --file "$file" \
       --line-start "$line_start" --line-end "$line_end" \
+      --sha "$head_sha" \
       --user-map "$user_map" \
       --default-meegle "${MEEGLE_DEFAULT_ASSIGNEE:-}" 2>/dev/null || echo '{}')
 
