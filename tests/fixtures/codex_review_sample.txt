@@ -1,0 +1,5 @@
+### 💡 Codex Review
+
+P0: src/auth.py:42 `login()` 失败时 except 块吞掉异常，调用方拿到 None 但以为成功
+P2: src/util.py:15 `format_time()` 没处理 None 输入，会抛 AttributeError
+P1: foo.go 缺少错误处理 — 但仓库里根本没有 foo.go，应该是模型幻觉
