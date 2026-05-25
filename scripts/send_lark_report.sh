@@ -1176,10 +1176,10 @@ summarize_review_with_ai() {
     return 1
   fi
 
-  local workdir="${WORKDIR:-}/$(basename "$repo")"
-  [[ -d "$workdir" ]] || workdir="${WORKDIR:-}/$repo"
+  local workdir
+  workdir="$(repo_dir "$(github_repo "$repo")")"
   if [[ ! -d "$workdir" ]]; then
-    log "codex_review: 镜像目录不存在 $workdir，跳过"
+    log "codex_review: 镜像目录不存在 ${workdir}，跳过"
     return 1
   fi
 
@@ -2074,8 +2074,7 @@ print(json.dumps({
     else
       log "DRY_RUN=1，已发送测试${report_marker}：$gitlab_path@$branch"
     fi
-    mirror_dir="${WORKDIR}/$(basename "$gitlab_path")"
-    [[ -d "$mirror_dir" ]] || mirror_dir="$WORKDIR/$gitlab_path"
+    mirror_dir="$(repo_dir "$(github_repo "$gitlab_path")")"
     create_meegle_bugs "$mirror_dir" || log "meegle batch 含错误，看 ${STATE_DIR}/meegle-created.log"
     sent_any=1
   done < "$RUN_FILE"
