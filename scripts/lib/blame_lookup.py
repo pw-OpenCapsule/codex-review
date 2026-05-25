@@ -76,7 +76,10 @@ def main():
 
 
 def lookup_user_map(path: str, email: str) -> str:
-    """TSV: git_email\tlark_user_id\tmeegle_user_key (第3列可选)."""
+    """TSV: git_identifier\tlark_open_id\tdisplay_name (col 3 is name, not ID).
+
+    Returns col 2 (lark_open_id like ou_xxx) which is what scripts consume.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -84,11 +87,8 @@ def lookup_user_map(path: str, email: str) -> str:
                 if not line or line.startswith("#"):
                     continue
                 parts = line.split("\t")
-                if parts[0].lower() == email.lower():
-                    if len(parts) >= 3:
-                        return parts[2]
-                    if len(parts) >= 2:
-                        return parts[1]
+                if parts and parts[0].lower() == email.lower() and len(parts) >= 2:
+                    return parts[1]
     except Exception:
         pass
     return ""
