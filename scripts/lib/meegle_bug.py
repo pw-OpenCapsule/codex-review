@@ -107,8 +107,12 @@ def build_payload(b: dict) -> dict:
     sev = b.get("severity")
     if sev and sev in SEV_MAP:
         fields.append({"field_key": "severity", "field_value": SEV_MAP[sev]})
-    assignee = b.get("assignee")
-    if assignee:
+    # Meegle current_status_operator wants its own numeric user_key.
+    # Lark open_id (ou_xxx) and display names are NOT accepted and cause API errors.
+    # If the resolver returns something that's not a numeric user_key,
+    # leave the field unset and let Meegle default to the creator.
+    assignee = (b.get("assignee") or "").strip()
+    if assignee.isdigit():
         fields.append({"field_key": "current_status_operator",
                        "field_value": [assignee]})
     return {"fields": fields}
