@@ -65,9 +65,11 @@ def main():
 
 
 def make_idempotency_key(bug: dict) -> str:
+    """Key on (pr_url, file, line_start). Summary text and line_end are
+    excluded because codex paraphrases summaries and varies line ranges
+    between runs; same PR + file + starting line = same issue."""
     raw = "|".join([bug.get("pr_url", ""), bug.get("file", ""),
-                    str(bug.get("line_start", 0)),
-                    bug.get("summary", "")[:80]])
+                    str(bug.get("line_start", 0))])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
