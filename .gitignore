@@ -5,6 +5,8 @@
 .DS_Store
 .runtime/
 repos.txt.back
+__pycache__/
+*.pyc
 
 # Deployment-local configuration. Keep real values out of Git.
 /config/settings.env
