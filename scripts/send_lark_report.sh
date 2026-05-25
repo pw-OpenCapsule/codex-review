@@ -1971,7 +1971,11 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
         fi
         if [[ -n "$file" && "${line_start:-0}" != "0" ]]; then
           pr_url_safe="${pr_url:-https://github.com/${GITHUB_ORG}/$(basename "$gitlab_path")/pull/${pr_number}}"
-          issue_json=$(python3 -c '
+          issue_json=$(S_SEV="$severity" S_SUMMARY="$summary" S_FILE="$file" \
+            S_LS="$line_start" S_LE="$line_end" S_EV="$evidence" \
+            S_ORIG="$review_text" S_REPO="$(basename "$gitlab_path")" \
+            S_PR="$pr_number" S_PRURL="$pr_url_safe" \
+            python3 -c '
 import json, os
 print(json.dumps({
   "severity": os.environ["S_SEV"],
@@ -1985,10 +1989,7 @@ print(json.dumps({
   "pr":       os.environ["S_PR"],
   "pr_url":   os.environ["S_PRURL"],
 }, ensure_ascii=False))
-' S_SEV="$severity" S_SUMMARY="$summary" S_FILE="$file" \
-  S_LS="$line_start" S_LE="$line_end" S_EV="$evidence" \
-  S_ORIG="$review_text" S_REPO="$(basename "$gitlab_path")" \
-  S_PR="$pr_number" S_PRURL="$pr_url_safe")
+')
           ISSUES_FOR_MEEGLE+=("$issue_json")
         fi
         content+="$line"$'\n'
