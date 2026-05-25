@@ -148,7 +148,17 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 - scripts/init_repos.sh：首次建仓与同步（不创建 PR / 评论）
 - scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 REPOS_FILE
 - scripts/send_lark_report.sh：发送 Lark 报告
+- scripts/build_review_dashboard.sh：从历史 run 记录和 GitHub PR 状态生成静态 review 状态页
 - templates/AGENTS.md：放在每个镜像仓库根目录
+
+Review 状态页
+- 生成最近 30 天状态页：`./scripts/build_review_dashboard.sh`
+- 指定范围：`./scripts/build_review_dashboard.sh --days 90`
+- 按项目生成：`./scripts/build_review_dashboard.sh --repo pw-admin`
+- 默认输出：
+  - `$RUN_DIR/review-dashboard.html`
+  - `$RUN_DIR/review-dashboard.json`
+- 页面展示已处理、未处理、等待审查、是否已发送群消息，并支持前端搜索/筛选。
 
 白名单格式
 - group/project@branch [daily|every3d|every5d|weekly|manual]
