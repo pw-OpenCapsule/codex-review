@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>设计稿：Codex Exec 复核 + Meegle 自动建缺陷 + 远程部署</title>
+<style>
+:root {
+  --fg: #1a1a1a;
+  --fg-muted: #555;
+  --bg: #fdfdfb;
+  --accent: #b8472f;
+  --border: #d8d4cc;
+  --code-bg: #f3f0ea;
+  --warn: #c47900;
+  --ok: #4a7c2f;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 2.5rem 2rem 4rem;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.65;
+  font-size: 15px;
+}
+header {
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 1rem;
+  margin-bottom: 2rem;
+}
+header h1 { margin: 0 0 0.4rem; font-size: 1.6rem; }
+header .meta { color: var(--fg-muted); font-size: 0.9rem; }
+h2 {
+  margin-top: 2.5rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.25rem;
+  color: var(--accent);
+}
+h3 { margin-top: 1.6rem; font-size: 1.05rem; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.8rem 0 1.2rem;
+  font-size: 0.92rem;
+}
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.45rem 0.7rem;
+  vertical-align: top;
+  text-align: left;
+}
+th { background: var(--code-bg); font-weight: 600; }
+code {
+  font-family: "SF Mono", "Menlo", Consolas, monospace;
+  background: var(--code-bg);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.88em;
+}
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  border-left: 3px solid var(--accent);
+}
+pre code { background: none; padding: 0; }
+aside {
+  background: #fff8e8;
+  border-left: 3px solid var(--warn);
+  padding: 0.7rem 1rem;
+  margin: 1rem 0;
+  font-size: 0.92rem;
+}
+ul, ol { padding-left: 1.4rem; }
+li { margin: 0.2rem 0; }
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--code-bg);
+  color: var(--fg-muted);
+}
+.badge.new { background: #e6f3df; color: var(--ok); }
+.badge.remove { background: #fbe1da; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>设计稿：Codex Exec 复核 + Meegle 自动建缺陷 + 远程部署</h1>
+  <div class="meta">日期：2026-05-25 · 作者：leo + Claude · 项目：codex-review</div>
+</header>
+
+<h2>1. 背景</h2>
+<p>
+当前 <code>send_lark_report.sh</code> 依赖外部 <code>codex.leeguoo.com</code> 把 codex 原始审查结果翻译成中文 P0–P5 摘要。本次改造将三件事一起做：
+</p>
+<ol>
+  <li>把翻译换成<strong>本地 codex exec</strong> 在已同步的镜像 repo 里做<strong>复核 + 翻译</strong>（剔除幻觉、保留真实问题）；</li>
+  <li>飞书消息发送成功后<strong>自动调用 meegle-cli</strong>，每个 P0–P5 问题各建一条缺陷到 Meegle「Code Review」项目；</li>
+  <li>生产运行迁移到 <code>192.168.0.190</code>（Mac，已装 codex / meegle CLI），本地只负责写代码并通过 GitHub 部署。</li>
+</ol>
+
+<h2>2. 现状 → 目标对照</h2>
+<table>
+  <thead><tr><th>项目</th><th>现状</th><th>目标</th></tr></thead>
+  <tbody>
+    <tr><td>翻译 / 摘要</td><td>HTTPS POST 到 <code>codex.leeguoo.com</code></td><td>本地 <code>codex exec</code>（含真伪复核）</td></tr>
+    <tr><td>责任人定位</td><td>PR 作者 / introducer（整 PR 级）</td><td>每个 issue 各自 <code>git blame</code> 到具体行</td></tr>
+    <tr><td>Bug 入库</td><td>无</td><td>Meegle Code Review 项目，每问题一条</td></tr>
+    <tr><td>运行机器</td><td>本机</td><td>远程 <code>leo@192.168.0.190</code>（crontab 现役）</td></tr>
+    <tr><td>本地角色</td><td>跑生产</td><td>写代码 → push → 远程 pull</td></tr>
+  </tbody>
+</table>
+
+<h2>3. 整体数据流</h2>
+<pre><code>crontab on 192.168.0.190 (Asia/Tokyo)
+  06:00  daily_review.sh           # 不变
+  09:00  send_lark_report.sh
+         ├─ 拉 PR codex review 评论
+         ├─ codex exec 在 ${WORKDIR}/${repo} 里复核 + 翻译  ← 新
+         │     输入: 原 review + PR 元信息
+         │     输出: JSON { issues, rejected }
+         ├─ 对每个 issue 跑 git blame(file:line)            ← 新
+         │     → email → LARK_USER_MAP → meegle_user_key
+         ├─ 拼 Lark 消息 → POST webhook
+         └─ webhook 成功 → 对每个 issue 调 meegle workitem create  ← 新
+
+本地开发
+  Edit 多文件 → 逻辑 commit → push GitHub
+              → scripts/deploy.sh → ssh leo@192.168.0.190 'git pull --ff-only'</code></pre>
+
+<h2>4. Codex Exec 复核 + 翻译</h2>
+
+<h3>4.1 调用形态</h3>
+<pre><code>cd "${WORKDIR}/${repo}"
+git checkout "${PR_HEAD_SHA}"   # blame / 读源码所需
+
+codex exec --skip-git-repo-check --output-last-message /tmp/codex-out.txt - &lt;&lt;EOF
+${PROMPT_HEADER}
+${REVIEW_TEXT}
+EOF</code></pre>
+
+<h3>4.2 Prompt 设计</h3>
+<pre><code>你是代码审查复核员。下面是 codex 对 PR 的原始审查输出。
+任务：
+1. 在当前工作目录读取被指出的代码，验证每个问题是否真实存在
+2. 剔除幻觉 / 误报（描述与代码不符、文件不存在、行号无意义等）
+3. 保留下来的问题翻译成中文，按 P0–P5 分级
+
+严格输出 JSON（不要任何额外文字）：
+{
+  "issues": [
+    { "severity": "P0|P1|P2|P3|P4|P5",
+      "summary_zh": "中文问题描述（保留反引号包裹的标识符）",
+      "file": "相对路径",
+      "line_start": &lt;int&gt;,
+      "line_end": &lt;int&gt;,
+      "evidence": "复核理由" }
+  ],
+  "rejected": [
+    { "severity": "P?", "original": "原文摘录", "reason": "为什么判为误报" }
+  ]
+}
+
+原始审查：{REVIEW_TEXT}
+PR 元信息：仓库={REPO} 分支={BRANCH} PR={PR_NUMBER} HEAD={SHA}</code></pre>
+
+<h3>4.3 错误处理</h3>
+<table>
+  <thead><tr><th>情况</th><th>行为</th></tr></thead>
+  <tbody>
+    <tr><td>codex exec 超时（默认 300s）</td><td>退到「无摘要直发原文」模式，日志告警</td></tr>
+    <tr><td>codex 输出非 JSON</td><td>同上，raw 写入 STATE_DIR/codex-bad-output/&lt;repo&gt;-&lt;pr&gt;.txt</td></tr>
+    <tr><td>issues 为空但 rejected 非空</td><td>跳过 issue 列表，仅发 PR 链接，Meegle 也不建单</td></tr>
+    <tr><td>codex 二进制不存在</td><td>启动时检测，缺则 fail send_lark_report 整个流程</td></tr>
+  </tbody>
+</table>
+
+<h3>4.4 配置变更</h3>
+<table>
+  <thead><tr><th>变更</th><th>变量</th></tr></thead>
+  <tbody>
+    <tr><td><span class="badge remove">删除</span></td><td><code>CODEX_SUMMARY_API</code>, <code>CODEX_SUMMARY_TOKEN</code>, <code>CODEX_SUMMARY_MODEL</code></td></tr>
+    <tr><td><span class="badge new">新增</span></td><td><code>CODEX_EXEC_BIN</code> (默认 <code>codex</code>)</td></tr>
+    <tr><td><span class="badge new">新增</span></td><td><code>CODEX_EXEC_TIMEOUT</code> (默认 300)</td></tr>
+    <tr><td><span class="badge new">新增</span></td><td><code>CODEX_EXEC_MODEL</code> (留空用默认)</td></tr>
+    <tr><td><span class="badge new">新增</span></td><td><code>CODEX_EXEC_EXTRA_ARGS</code> (透传)</td></tr>
+  </tbody>
+</table>
+
+<h2>5. Meegle 自动建缺陷</h2>
+
+<h3>5.1 触发与幂等</h3>
+<ul>
+  <li>触发：飞书 webhook 返回成功 <strong>且</strong> issues 非空。</li>
+  <li>幂等：<code>${STATE_DIR}/meegle-created.tsv</code> 记录 <code>pr_url \t issue_index \t work_item_id</code>，重跑时命中跳过。</li>
+  <li>粒度：<strong>每个 issue 一条 bug</strong>。</li>
+</ul>
+
+<h3>5.2 字段映射</h3>
+<table>
+  <thead><tr><th>Meegle field_key</th><th>来源</th><th>示例</th></tr></thead>
+  <tbody>
+    <tr><td><code>name</code></td><td><code>[${repo}#${PR}] ${summary_zh[:60]}</code></td><td><code>[xhs-toolkit#42] login 401 后无错误提示</code></td></tr>
+    <tr><td><code>description</code></td><td>多行模板（见 5.3）</td><td>—</td></tr>
+    <tr><td><code>current_status_operator</code></td><td>blame → LARK_USER_MAP → meegle_user_key</td><td><code>["7368413876789141507"]</code></td></tr>
+    <tr><td><code>severity</code></td><td>P0–P5 → select option_id（启动时一次性查 meta-fields 建表）</td><td>—</td></tr>
+    <tr><td><code>tags</code></td><td>固定 <code>codex-review</code> + 仓库名</td><td><code>["codex-review", "xhs-toolkit"]</code></td></tr>
+  </tbody>
+</table>
+
+<h3>5.3 description 模板</h3>
+<pre><code>## 来源
+- 仓库: ${repo}
+- PR: ${pr_url}
+- 文件: ${file}:${line_start}-${line_end}
+- 引入: ${blame_author} @ ${blame_sha} (${blame_date})
+
+## 复核结论
+${codex_evidence}
+
+## 原始审查摘录
+${original_review_excerpt}</code></pre>
+
+<h3>5.4 责任人三级兜底</h3>
+<ol>
+  <li><code>git blame ${file} -L${line_start},${line_end}</code> → email</li>
+  <li>email → <code>LARK_USER_MAP</code> → lark_user_id → meegle_user_key（meegle CLI 复用 Lark 身份）</li>
+  <li>任意一步失败 → <code>MEEGLE_DEFAULT_ASSIGNEE</code></li>
+  <li>仍失败 → 建无 assignee 的 bug（丢单比建错单更糟，宁愿留空）</li>
+</ol>
+
+<h3>5.5 配置新增</h3>
+<table>
+  <thead><tr><th>变量</th><th>默认</th></tr></thead>
+  <tbody>
+    <tr><td><code>MEEGLE_PROJECT_KEY</code></td><td><code>6a13e31e9407c20a72ed6e82</code></td></tr>
+    <tr><td><code>MEEGLE_WORK_ITEM_TYPE</code></td><td><code>issue</code></td></tr>
+    <tr><td><code>MEEGLE_BIN</code></td><td><code>meegle</code></td></tr>
+    <tr><td><code>MEEGLE_DEFAULT_ASSIGNEE</code></td><td>(空)</td></tr>
+    <tr><td><code>MEEGLE_AUTO_CREATE</code></td><td><code>1</code>（<code>--dry</code> 强制为 0）</td></tr>
+  </tbody>
+</table>
+
+<h2>6. 远程部署</h2>
+
+<h3>6.1 远程现状（已确认）</h3>
+<ul>
+  <li>主机：<code>leo@192.168.0.190</code>（Mac，免密 SSH 已通）</li>
+  <li>代码目录：<code>/Users/leo/codex-review</code>（不是 README 写的 <code>/opt/codex-review</code>）</li>
+  <li>codex 二进制：<code>/opt/homebrew/bin/codex</code></li>
+  <li>crontab：06:00 daily_review · 09:00 send_lark_report（Asia/Tokyo）</li>
+</ul>
+
+<h3>6.2 新增 <code>scripts/deploy.sh</code></h3>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+REMOTE="leo@192.168.0.190"
+REMOTE_DIR="/Users/leo/codex-review"
+
+# 1. 远程冲突检查
+if ! ssh "${REMOTE}" "cd ${REMOTE_DIR} &amp;&amp; git status --porcelain | wc -l | grep -q '^ *0$'"; then
+  echo "❌ Remote has local changes, aborting"; exit 1
+fi
+# 2. 撞 cron 检查
+if ssh "${REMOTE}" "pgrep -f 'daily_review.sh|send_lark_report.sh' &gt;/dev/null"; then
+  echo "❌ Cron job currently running on remote, retry later"; exit 1
+fi
+# 3. 本地 commit + push
+git add -A
+git commit -m "${1:-deploy: $(date +%F\ %T)}" || echo "(nothing to commit)"
+git push origin main
+# 4. 远程拉取
+ssh "${REMOTE}" "cd ${REMOTE_DIR} &amp;&amp; git pull --ff-only"
+echo "✅ Deployed"</code></pre>
+
+<h3>6.3 工作流</h3>
+<table>
+  <thead><tr><th>阶段</th><th>谁做</th><th>动作</th></tr></thead>
+  <tbody>
+    <tr><td>编辑</td><td>Claude</td><td>Edit / Write 多文件</td></tr>
+    <tr><td>本地验证</td><td>Claude</td><td>语法 / lint，必要时 <code>--dry</code> 自我检查</td></tr>
+    <tr><td>部署触发</td><td>用户</td><td>说一句「deploy」或 <code>./scripts/deploy.sh "msg"</code></td></tr>
+    <tr><td>部署执行</td><td>Claude</td><td>跑 deploy.sh</td></tr>
+    <tr><td>远程验证</td><td>Claude</td><td><code>ssh leo@192.168.0.190 'cd ~/codex-review &amp;&amp; ./scripts/send_lark_report.sh --dry'</code></td></tr>
+  </tbody>
+</table>
+
+<h2>7. 需要改的文件</h2>
+<table>
+  <thead><tr><th>文件</th><th>变化</th></tr></thead>
+  <tbody>
+    <tr><td><code>scripts/send_lark_report.sh</code></td><td>替换 <code>summarize_review_with_ai</code>；加 per-issue blame；末尾加 meegle 调用</td></tr>
+    <tr><td><code>scripts/lib.sh</code></td><td>抽工具函数：<code>codex_review_normalize()</code>、<code>git_blame_line()</code>、<code>meegle_create_bug()</code></td></tr>
+    <tr><td><code>config/settings.env</code></td><td>删 3 个旧变量，加 ~10 个新变量</td></tr>
+    <tr><td><code>scripts/deploy.sh</code><span class="badge new">新</span></td><td>commit + push + ssh pull，含锁检测</td></tr>
+    <tr><td><code>README.md</code></td><td>更新流程图与配置说明</td></tr>
+  </tbody>
+</table>
+
+<h2>8. 测试策略</h2>
+<ul>
+  <li><strong>codex exec mock</strong>：开发期用 <code>CODEX_EXEC_BIN=./tests/mock_codex.sh</code> 注入固定 JSON，跑通管线。</li>
+  <li><strong>meegle dry-run</strong>：meegle CLI 自带 <code>--dry-run</code>，在 <code>send_lark_report.sh --dry</code> 模式自动启用。</li>
+  <li><strong>真实试跑</strong>：远程部署后挑一个最近的 PR，<code>FORCE_REVIEW=1</code> 重跑并观察 Meegle / 飞书结果。</li>
+  <li><strong>幂等验证</strong>：同一 PR 跑两次，第二次应跳过所有 meegle create。</li>
+</ul>
+
+<h2>9. 不在本次范围</h2>
+<ul>
+  <li>跨 Meegle 项目分流（用户已确认只用 Code Review 一个）</li>
+  <li>严重度阈值过滤（用户要全量建单）</li>
+  <li>Meegle bug 状态回写到飞书 / GitHub PR 评论</li>
+  <li>Meegle CLI 的 OAuth token 自动刷新（依赖 <code>meegle auth login</code> 现有机制）</li>
+</ul>
+
+</body>
+</html>
