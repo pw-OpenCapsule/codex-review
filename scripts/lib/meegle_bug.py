@@ -64,6 +64,26 @@ def main():
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
 
+def classify_bug_end(file_path: str) -> str:
+    """Guess bug_classification (ios/android/fe/server) from file extension."""
+    f = (file_path or "").lower()
+    if not f:
+        return ""
+    if f.endswith((".swift", ".m", ".mm")) or "/ios/" in f:
+        return "ios"
+    if f.endswith((".kt", ".java")) and "/android" in f:
+        return "android"
+    if f.endswith((".kt", ".kts")) or "/android" in f:
+        return "android"
+    if f.endswith((".vue", ".tsx", ".jsx", ".ts", ".js", ".html",
+                   ".css", ".scss", ".less")):
+        return "fe"
+    if f.endswith((".java", ".go", ".py", ".rs", ".rb", ".php",
+                   ".cs", ".cpp", ".c", ".h", ".hpp", ".sql", ".sh")):
+        return "server"
+    return ""
+
+
 def make_idempotency_key(bug: dict) -> str:
     """Key on (pr_url, file, line_start). Summary text and line_end are
     excluded because codex paraphrases summaries and varies line ranges
@@ -92,15 +112,33 @@ def save_state(path: str, key: str, wid):
 
 
 def build_payload(b: dict) -> dict:
-    name = f"[{b.get('repo','?')}#{b.get('pr','?')}] {b.get('summary','')[:60]}"
+    # Title: clean summary only, no [repo#PR] prefix (that's noise; repo/PR
+    # info lives in description and tags).
+    summary = (b.get("summary") or "").strip()
+    name = summary[:80] if summary else "(无摘要)"
+
+    file_line = f"{b.get('file','')}:{b.get('line_start','')}"
+    if b.get("line_end") and b.get("line_end") != b.get("line_start"):
+        file_line += f"-{b.get('line_end')}"
+    introducer = b.get("blame_author") or "未知"
+    blame_sha = b.get("blame_sha") or ""
+    if blame_sha:
+        introducer += f" @ {blame_sha}"
+
+    severity_label = {
+        "P0": "P0 严重", "P1": "P1 重要", "P2": "P2 一般",
+        "P3": "P3 次要", "P4": "P4 微小", "P5": "P5 微小",
+    }.get(b.get("severity", ""), b.get("severity", ""))
+
+    # Lead description with the most useful info (location + PR link),
+    # so reviewers can act without scrolling. Detail follows.
     desc = (
-        f"## 来源\n"
-        f"- 仓库: {b.get('repo','')}\n"
-        f"- PR: {b.get('pr_url','')}\n"
-        f"- 文件: {b.get('file','')}:{b.get('line_start','')}-{b.get('line_end','')}\n"
-        f"- 引入: {b.get('blame_author','?')} @ {b.get('blame_sha','?')} ({b.get('blame_date','?')})\n\n"
-        f"## 复核结论\n{b.get('evidence','')}\n\n"
-        f"## 原始审查摘录\n{b.get('original','')}\n"
+        f"**{severity_label}** · `{file_line}` · 引入: {introducer}\n\n"
+        f"[查看 PR]({b.get('pr_url','')}) · 仓库 `{b.get('repo','')}`\n\n"
+        f"---\n\n"
+        f"## 问题\n{summary}\n\n"
+        f"## 复核结论\n{b.get('evidence') or '(无复核细节)'}\n\n"
+        f"## 原始审查摘录\n{b.get('original') or '(无)'}\n"
     )
     fields = [
         {"field_key": "name",        "field_value": name},
@@ -109,6 +147,10 @@ def build_payload(b: dict) -> dict:
     sev = b.get("severity")
     if sev and sev in SEV_MAP:
         fields.append({"field_key": "severity", "field_value": SEV_MAP[sev]})
+    classification = classify_bug_end(b.get("file", ""))
+    if classification:
+        fields.append({"field_key": "bug_classification",
+                       "field_value": classification})
     # Meegle current_status_operator wants its own numeric user_key.
     # Lark open_id (ou_xxx) and display names are NOT accepted and cause API errors.
     # If the resolver returns something that's not a numeric user_key,
