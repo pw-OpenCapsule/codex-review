@@ -238,6 +238,109 @@ gitlab_repo_url() {
   fi
 }
 
+# Run codex exec on a single review block. Outputs TSV one issue per line:
+# severity\tsummary_zh\tfile\tline_start\tline_end\tevidence
+# Args: repo branch pr sha workdir review_text
+call_codex_review() {
+  local repo="$1" branch="$2" pr="$3" sha="$4" workdir="$5" review_text="$6"
+  local review_file
+  review_file=$(mktemp)
+  printf '%s' "$review_text" >"$review_file"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local json
+  if ! json=$(python3 "$script_dir/lib/codex_review.py" \
+        --repo "$repo" --branch "$branch" --pr "$pr" --sha "$sha" \
+        --workdir "$workdir" --review-file "$review_file" 2>/dev/null); then
+    rm -f "$review_file"
+    return 1
+  fi
+  rm -f "$review_file"
+  printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+  d = json.loads(sys.stdin.read() or "{}")
+except Exception:
+  sys.exit(0)
+for i in d.get("issues", []):
+  print("\t".join([
+    i.get("severity","P5"),
+    i.get("summary_zh",""),
+    i.get("file",""),
+    str(i.get("line_start",0)),
+    str(i.get("line_end",0)),
+    i.get("evidence",""),
+  ]))
+'
+}
+
+# Drain ISSUES_FOR_MEEGLE array and create one Meegle bug per entry.
+# Args: workdir
+create_meegle_bugs() {
+  local workdir="$1"
+  [[ "${MEEGLE_AUTO_CREATE:-0}" == "1" ]] || { log "MEEGLE_AUTO_CREATE != 1，跳过建单"; return 0; }
+  [[ ${#ISSUES_FOR_MEEGLE[@]} -gt 0 ]] || return 0
+
+  local meegle_bin="${MEEGLE_BIN:-meegle}"
+  if ! command -v "$meegle_bin" >/dev/null 2>&1; then
+    log "meegle CLI 不存在 ($meegle_bin)，跳过建单"
+    return 0
+  fi
+
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local state_dir="${STATE_DIR:-/tmp}"
+  local state_file="$state_dir/meegle-created.tsv"
+  local user_map="${LARK_USER_MAP:-$ROOT_DIR/config/lark_user_map.tsv}"
+  local dry_flag=""
+  [[ "${LARK_DRY_RUN:-0}" == "1" ]] && dry_flag="--dry-run"
+  mkdir -p "$state_dir" 2>/dev/null || true
+
+  local issue_json
+  for issue_json in "${ISSUES_FOR_MEEGLE[@]}"; do
+    [[ -z "$issue_json" ]] && continue
+    local file line_start line_end summary
+    file=$(printf '%s' "$issue_json"       | python3 -c 'import json,sys;print(json.load(sys.stdin).get("file",""))')
+    line_start=$(printf '%s' "$issue_json" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("line_start",0))')
+    line_end=$(printf '%s' "$issue_json"   | python3 -c 'import json,sys;print(json.load(sys.stdin).get("line_end",0))')
+    summary=$(printf '%s' "$issue_json"    | python3 -c 'import json,sys;print(json.load(sys.stdin).get("summary",""))')
+
+    if [[ -z "$file" || "$line_start" == "0" ]]; then
+      log "meegle: 跳过 file/line 缺失的 issue: $summary"
+      continue
+    fi
+
+    local blame_json
+    blame_json=$(python3 "$script_dir/lib/blame_lookup.py" \
+      --workdir "$workdir" --file "$file" \
+      --line-start "$line_start" --line-end "$line_end" \
+      --user-map "$user_map" \
+      --default-meegle "${MEEGLE_DEFAULT_ASSIGNEE:-}" 2>/dev/null || echo '{}')
+
+    local enriched
+    enriched=$(python3 -c '
+import json, sys
+issue = json.loads(sys.argv[1])
+blame = json.loads(sys.argv[2] or "{}")
+issue["assignee"]     = blame.get("meegle_user_key", "")
+issue["blame_author"] = blame.get("author_name", "")
+issue["blame_sha"]    = (blame.get("sha", "") or "")[:8]
+issue["blame_date"]   = blame.get("date", "")
+print(json.dumps(issue, ensure_ascii=False))
+' "$issue_json" "$blame_json")
+
+    python3 "$script_dir/lib/meegle_bug.py" \
+      --project-key "${MEEGLE_PROJECT_KEY}" \
+      --work-item-type "${MEEGLE_WORK_ITEM_TYPE:-issue}" \
+      --state-file "$state_file" \
+      $dry_flag \
+      --bug "$enriched" \
+      >>"$state_dir/meegle-created.log" 2>&1 \
+      || log "meegle: create failed for [$file:$line_start] $summary"
+  done
+  log "meegle: 处理 ${#ISSUES_FOR_MEEGLE[@]} 条 issue 完毕"
+}
+
 if [[ -n "${ROOT_DIR:-}" ]]; then
   load_dotenv "$ROOT_DIR"
 fi
