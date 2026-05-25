@@ -81,16 +81,23 @@ _CODEX_NOISE_PATTERNS = [
 ]
 
 
-def extract_code_snippet(text: str) -> str:
+def extract_code_snippet(text: str, with_fence: bool = False) -> str:
     """Pull the FIRST non-trivial code block out of a codex review blob.
-    Returns the block wrapped in fences ready to drop into Markdown."""
+
+    By default returns just the code body (plain text, no fences) — this
+    renders correctly in Meegle multi-line text fields that don't parse
+    markdown. Pass with_fence=True to get markdown-fenced output for
+    contexts that DO render it (e.g. description rich text).
+    """
     if not text:
         return ""
     for lang, body in _CODE_FENCE_RE.findall(text):
         body = body.strip("\n")
         if not body or len(body.strip()) < 5:
             continue
-        return f"```{lang or 'plaintext'}\n{body}\n```"
+        if with_fence:
+            return f"```{lang or 'plaintext'}\n{body}\n```"
+        return body
     return ""
 
 
@@ -174,6 +181,7 @@ def build_payload(b: dict) -> dict:
         introducer += f" @ {blame_sha}"
 
     code_snippet = extract_code_snippet(b.get("original", ""))
+    code_snippet_fenced = extract_code_snippet(b.get("original", ""), with_fence=True)
     evidence = b.get("evidence") or ""
 
     fields = [{"field_key": "name", "field_value": name}]
@@ -204,8 +212,8 @@ def build_payload(b: dict) -> dict:
     if desc_parts:
         desc_parts.append("")
     desc_parts += ["## 问题", summary, ""]
-    if "MEEGLE_FIELD_CODE_SNIPPET" not in used_keys and code_snippet:
-        desc_parts += ["## 代码片段", code_snippet, ""]
+    if "MEEGLE_FIELD_CODE_SNIPPET" not in used_keys and code_snippet_fenced:
+        desc_parts += ["## 代码片段", code_snippet_fenced, ""]
     if "MEEGLE_FIELD_CODEX_VERIFY" not in used_keys and evidence:
         desc_parts += ["## codex 核实结论", evidence, ""]
     desc = "\n".join(desc_parts).strip()
