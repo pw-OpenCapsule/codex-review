@@ -8,7 +8,7 @@ Usage:
 
 Idempotency: state-file is a TSV "key\twork_item_id".
 """
-import argparse, json, os, subprocess, sys, hashlib
+import argparse, json, os, re, subprocess, sys, hashlib
 
 # 启动时一次性加载 severity 映射
 SEV_MAP = {}
@@ -62,6 +62,49 @@ def main():
     if wid:
         save_state(args.state_file, key, wid)
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+
+
+_CODE_FENCE_RE = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)\n```", re.S)
+_CODEX_NOISE_PATTERNS = [
+    re.compile(r"(?ms)^###\s*💡\s*Codex Review.*$"),
+    re.compile(r"(?ms)^Here are some automated review suggestions.*?$"),
+    re.compile(r"(?ms)^\*\*Reviewed commit:\*\*.*?$"),
+    re.compile(r"(?ms)^Codex has been enabled.*?(?=\n\n|\Z)"),
+    re.compile(r"(?ms)^When you \[sign up for Codex.*?(?=\n\n|\Z)"),
+    re.compile(r"(?ms)^CODEX_LOCATION\b.*$"),
+    re.compile(r"(?ms)^疑似责任人:.*?（依据: review 行 blame）"),
+    re.compile(r"(?ms)^【发现】\s*$"),
+    re.compile(r"(?ms)^- Open a pull request for review\s*$"),
+    re.compile(r"(?ms)^- Mark a draft as ready\s*$"),
+    re.compile(r'(?ms)^- Comment "@codex review"\.\s*$'),
+    re.compile(r"(?ms)^If Codex has suggestions.*?$"),
+]
+
+
+def extract_code_snippet(text: str) -> str:
+    """Pull the FIRST non-trivial code block out of a codex review blob.
+    Returns the block wrapped in fences ready to drop into Markdown."""
+    if not text:
+        return ""
+    for lang, body in _CODE_FENCE_RE.findall(text):
+        body = body.strip("\n")
+        if not body or len(body.strip()) < 5:
+            continue
+        return f"```{lang or 'plaintext'}\n{body}\n```"
+    return ""
+
+
+def clean_codex_noise(text: str) -> str:
+    """Strip GitHub PR template fluff (Codex intro, signup, etc.) from the
+    original review so reviewers see actual findings, not Codex boilerplate."""
+    if not text:
+        return ""
+    out = text
+    for pat in _CODEX_NOISE_PATTERNS:
+        out = pat.sub("", out)
+    # Collapse 3+ blank lines, trim
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
 
 
 def classify_bug_end(file_path: str) -> str:
@@ -130,16 +173,32 @@ def build_payload(b: dict) -> dict:
         "P3": "P3 次要", "P4": "P4 微小", "P5": "P5 微小",
     }.get(b.get("severity", ""), b.get("severity", ""))
 
+    code_snippet = extract_code_snippet(b.get("original", ""))
+    cleaned_original = clean_codex_noise(b.get("original", ""))
+
     # Lead description with the most useful info (location + PR link),
     # so reviewers can act without scrolling. Detail follows.
-    desc = (
-        f"**{severity_label}** · `{file_line}` · 引入: {introducer}\n\n"
-        f"[查看 PR]({b.get('pr_url','')}) · 仓库 `{b.get('repo','')}`\n\n"
-        f"---\n\n"
-        f"## 问题\n{summary}\n\n"
-        f"## 复核结论\n{b.get('evidence') or '(无复核细节)'}\n\n"
-        f"## 原始审查摘录\n{b.get('original') or '(无)'}\n"
-    )
+    parts = [
+        f"**{severity_label}** · `{file_line}` · 引入: {introducer}",
+        "",
+        f"[查看 PR]({b.get('pr_url','')}) · 仓库 `{b.get('repo','')}`",
+        "",
+        "---",
+        "",
+        "## 问题",
+        summary,
+        "",
+    ]
+    if code_snippet:
+        parts += ["## 代码片段", code_snippet, ""]
+    parts += [
+        "## codex 核实结论",
+        b.get("evidence") or "(无复核细节)",
+        "",
+    ]
+    if cleaned_original:
+        parts += ["## 原始审查摘录", cleaned_original, ""]
+    desc = "\n".join(parts)
     fields = [
         {"field_key": "name",        "field_value": name},
         {"field_key": "description", "field_value": desc},
