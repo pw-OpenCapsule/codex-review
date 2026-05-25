@@ -155,8 +155,13 @@ def save_state(path: str, key: str, wid):
 
 
 def build_payload(b: dict) -> dict:
-    # Title: clean summary only, no [repo#PR] prefix (that's noise; repo/PR
-    # info lives in description and tags).
+    """Build a Meegle workitem.create payload, spreading content across
+    discrete custom fields instead of one giant description.
+
+    Custom field keys are env-configurable so a different Meegle project can
+    rewire them without touching this file. Unset → that piece falls back
+    into the description blob.
+    """
     summary = (b.get("summary") or "").strip()
     name = summary[:80] if summary else "(无摘要)"
 
@@ -168,41 +173,46 @@ def build_payload(b: dict) -> dict:
     if blame_sha:
         introducer += f" @ {blame_sha}"
 
-    severity_label = {
-        "P0": "P0 严重", "P1": "P1 重要", "P2": "P2 一般",
-        "P3": "P3 次要", "P4": "P4 微小", "P5": "P5 微小",
-    }.get(b.get("severity", ""), b.get("severity", ""))
-
     code_snippet = extract_code_snippet(b.get("original", ""))
-    cleaned_original = clean_codex_noise(b.get("original", ""))
+    evidence = b.get("evidence") or ""
 
-    # Lead description with the most useful info (location + PR link),
-    # so reviewers can act without scrolling. Detail follows.
-    parts = [
-        f"**{severity_label}** · `{file_line}` · 引入: {introducer}",
-        "",
-        f"[查看 PR]({b.get('pr_url','')}) · 仓库 `{b.get('repo','')}`",
-        "",
-        "---",
-        "",
-        "## 问题",
-        summary,
-        "",
-    ]
-    if code_snippet:
-        parts += ["## 代码片段", code_snippet, ""]
-    parts += [
-        "## codex 核实结论",
-        b.get("evidence") or "(无复核细节)",
-        "",
-    ]
-    if cleaned_original:
-        parts += ["## 原始审查摘录", cleaned_original, ""]
-    desc = "\n".join(parts)
-    fields = [
-        {"field_key": "name",        "field_value": name},
-        {"field_key": "description", "field_value": desc},
-    ]
+    fields = [{"field_key": "name", "field_value": name}]
+
+    # ---- structured fields (preferred) ----
+    field_map = {
+        "MEEGLE_FIELD_CODE_LOCATION":  ("code_location",      file_line),
+        "MEEGLE_FIELD_PR_URL":         ("pr_url_link",        b.get("pr_url", "")),
+        "MEEGLE_FIELD_INTRODUCER":     ("introducer",         introducer),
+        "MEEGLE_FIELD_CODE_SNIPPET":   ("code_snippet",       code_snippet),
+        "MEEGLE_FIELD_CODEX_VERIFY":   ("codex_verification", evidence),
+    }
+    used_keys = set()
+    for env_name, (_label, value) in field_map.items():
+        field_key = os.environ.get(env_name, "").strip()
+        if field_key and value:
+            fields.append({"field_key": field_key, "field_value": value})
+            used_keys.add(env_name)
+
+    # ---- description: only include what didn't make it into a custom field ----
+    desc_parts = []
+    if "MEEGLE_FIELD_CODE_LOCATION" not in used_keys:
+        desc_parts += [f"**位置**: `{file_line}`"]
+    if "MEEGLE_FIELD_PR_URL" not in used_keys and b.get("pr_url"):
+        desc_parts += [f"**PR**: {b.get('pr_url')}"]
+    if "MEEGLE_FIELD_INTRODUCER" not in used_keys:
+        desc_parts += [f"**引入**: {introducer}"]
+    if desc_parts:
+        desc_parts.append("")
+    desc_parts += ["## 问题", summary, ""]
+    if "MEEGLE_FIELD_CODE_SNIPPET" not in used_keys and code_snippet:
+        desc_parts += ["## 代码片段", code_snippet, ""]
+    if "MEEGLE_FIELD_CODEX_VERIFY" not in used_keys and evidence:
+        desc_parts += ["## codex 核实结论", evidence, ""]
+    desc = "\n".join(desc_parts).strip()
+    if desc:
+        fields.append({"field_key": "description", "field_value": desc})
+
+    # ---- built-in fields ----
     sev = b.get("severity")
     if sev and sev in SEV_MAP:
         fields.append({"field_key": "severity", "field_value": SEV_MAP[sev]})
