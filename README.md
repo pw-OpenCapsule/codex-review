@@ -1,7 +1,7 @@
 # AI 代码审计（每周/每日）
 
-本仓库包含脚本与配置，用于对 GitHub 镜像仓库执行每日/每周 Codex Code Review usage
-（官方用量口径），并发送 Lark 报告。
+本仓库包含脚本与配置，用于对本地镜像仓库执行每日/每周 Codex SDK 本地代码审查，
+并发送 Lark 报告；可选把风险项写入 Lark 多维表格跟踪。
 
 仓库地址：https://github.com/pw-OpenCapsule/codex-review
 
@@ -61,14 +61,16 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 
 依赖
 - bash, git, curl
-- gh CLI 使用审计 Bot 登录
-  - 无人值守建议配置 GH_TOKEN/GITHUB_TOKEN，并运行一次 gh auth setup-git
+- Python 3.10+
+- Codex SDK：`pip install openai-codex`
+- Lark Base 写入可选依赖：`lark-cli`
+- gh CLI 仅用于初始化/同步 GitHub 镜像仓库；本地审查不创建审计 PR
 
 快速开始
 1) 从 `config/*.example.*` 复制出本地真实配置
 2) 编辑 `config/settings.env`
 3) 编辑 `config/repos.txt`（支持分支）
-4) （可选）首次运行 scripts/init_repos.sh（仅建仓与同步，不创建 PR / 评论）
+4) （可选）首次运行 scripts/init_repos.sh（仅建仓与同步）
 5) （可选）运行 scripts/sync_gogs_repos.sh（从 Gogs 同步仓库列表）
 6) 运行 scripts/daily_review.sh
 7) 运行 scripts/send_lark_report.sh
@@ -78,43 +80,41 @@ export LARK_USER_MAP=/etc/codex-review/lark_user_map.tsv
 - 仅每周运行：0 8 * * 1 /opt/codex-review/scripts/daily_review.sh && /opt/codex-review/scripts/send_lark_report.sh
 
 无人值守建议
-- GitHub：设置 GH_TOKEN 或 GITHUB_TOKEN（Bot Token），确保 gh 与 git 均可无交互使用
+- GitHub：如需自动创建/更新镜像仓库，设置 GH_TOKEN 或 GITHUB_TOKEN（Bot Token）
 - GitLab：配置 GITLAB_AUTH="user:token" 避免交互登录
+- Codex SDK：运行机器需能使用本地 Codex app-server
 
 手动重跑（可选）
-- FORCE_REVIEW=1：忽略上次基线，重新生成本次 PR 差异
-- FORCE_COMMENT=1：即使已有 @codex review，也会追加一条触发评论
+- FORCE_REVIEW=1：忽略上次基线，重新生成本次审查范围
 
 自动发送报告（可选）
-- AUTO_SEND_LARK=1：在创建 PR 后自动等待审查结果并发送 Lark 报告
-- REVIEW_WAIT_SECONDS：最长等待秒数（到期仍发送）
-- REVIEW_POLL_INTERVAL：轮询间隔秒数
-- CODEX_REVIEW_AUTHOR：指定 Codex 账号 login 用于判断审查完成（不填则根据评论内容判断）
+- AUTO_SEND_LARK=1：本地审查完成后自动发送 Lark 报告
 - 日报在周六/周日不发送，周一补发周六/周日并发送周一日报
-- 审查无风险项且未标注 P0-P5 时不发送 Lark 与摘要
+- 审查无风险项时不发送 Lark 报告
 
-报告内容复核与翻译（codex exec，2026-05-25 起替换 codex.leeguoo.com）
-- 调本地 `codex exec` 在镜像 repo 里读源码做「复核 + 翻译」：剔除幻觉/误报，剩下的按 P0-P5 翻译成中文
-- 复核工作目录为 `${WORKDIR}/<mirror-repo>`，对 PR 文件做 git blame 时也是这个目录
+Codex SDK 本地审查
+- `daily_review.sh` 计算 `${base_sha}..${head_sha}` 后，直接在镜像 repo 中调用 Codex SDK 审查 diff。
+- 不创建 GitHub 审计 PR，不调用 `codex exec`，不调用 `code.leeguoo.com` / `codex.leeguoo.com` 或本地 HTTP 网关。
+- 审查结果写入：
+  - `$RUN_DIR/reviews/<date>/<repo>-<branch>.json`
+  - `$RUN_DIR/reviews/<date>/<repo>-<branch>.md`
 - 配置项：
-  - `CODEX_EXEC_BIN`（默认 `codex`）— codex CLI 路径
-  - `CODEX_EXEC_TIMEOUT`（默认 300）— 单次复核超时秒数
-  - `CODEX_EXEC_MODEL`（默认空）— 留空用 codex 默认模型
-  - `CODEX_EXEC_EXTRA_ARGS`（默认空）— 透传给 codex 的额外参数
-- 旧的 `CODEX_SUMMARY_API/TOKEN/MODEL` 已废弃，如有残留请删除
+  - `CODEX_SDK_MODEL`（默认 `gpt-5.3-codex`）
+  - `CODEX_SDK_SANDBOX`（默认 `read_only`）
+  - `CODEX_SDK_TIMEOUT`（默认 300）
+  - `CODEX_SDK_MAX_DIFF_CHARS`（默认 120000）
 
-Meegle 自动建缺陷
-- 飞书 webhook 发送成功后，每个 P0-P5 问题各建一条 Meegle 缺陷到「Code Review」项目（type=`issue`）
-- 责任人 (`current_status_operator`) 通过 `git blame` 找到引入这行代码的人，经 `LARK_USER_MAP` 映射成 Meegle user_key
-- 幂等：`${STATE_DIR}/meegle-created.tsv` 记录已建过的 (file, line, summary) → work_item_id，重跑不会重复建
+Lark Base 问题跟踪（可选）
+- Lark 群消息负责通知；多维表格负责长期跟踪风险项状态。
+- 开启 `LARK_BASE_ENABLED=1` 后，发送报告时会按 `issue_key` 查找并 upsert 记录。
 - 配置项：
-  - `MEEGLE_PROJECT_KEY`（默认 Code Review project）
-  - `MEEGLE_WORK_ITEM_TYPE="issue"`
-  - `MEEGLE_BIN`（默认 `meegle`）— meegle-cli 路径
-  - `MEEGLE_DEFAULT_ASSIGNEE`（默认空）— blame 失败时的兜底人
-  - `MEEGLE_AUTO_CREATE`（默认 1）— 总开关，dry-run 时 meegle CLI 自动走 `--dry-run`
-  - `MEEGLE_SEVERITY_MAP`（默认 `P0:1 P1:2 P2:3 P3:4 P4:5 P5:5`，对应严重/重要/一般/次要/微小）
-- 首次使用前需在运行机器上 `meegle auth login --device-code`
+  - `LARK_BASE_TOKEN`
+  - `LARK_BASE_TABLE_ID`
+  - `LARK_CLI_BIN`（默认 `lark-cli`）
+- 推荐字段：
+  - `issue_key`, `repo`, `branch`, `severity`, `status`, `summary`, `evidence`
+  - `file`, `line_start`, `line_end`, `introduced_by`, `lark_owner`
+  - `base_sha`, `head_sha`, `artifact_path`, `review_date`, `last_seen_at`
 
 其它运行配置
 - LARK_USER_MAP：Git 与 Lark 用户映射表（默认 config/lark_user_map.tsv）
@@ -123,11 +123,10 @@ Meegle 自动建缺陷
 - LARK_MENTION_MAX：报告中最多 @ 的作者数量（默认 3）
 - SNIPPET_CONTEXT：代码片段上下文行数（默认 3，向上/向下各扩展）
 
-拉取请求（PR）状态机（每日/每周）
+本地审查状态机（每日/每周）
 - 若自上次审计后无变更，跳过。
-- 若本次拉取请求已存在，复用。
-- 若本次拉取请求已存在但已关闭，跳过并推进基线。
-- 每个拉取请求仅触发一次 @codex review。
+- 若本次有变更，写入本地 review artifact。
+- 审查成功后推进基线。
 
 风险评分与排序
 - 评分 = (risk_files * DIR_WEIGHT) + loc_score
@@ -137,9 +136,9 @@ Meegle 自动建缺陷
 
 建议确认的配置
 - GITHUB_ORG, GITHUB_REPO_VISIBILITY, DEFAULT_BRANCH
-- AUTO_SEND_LARK, REVIEW_WAIT_SECONDS, REVIEW_POLL_INTERVAL, CODEX_REVIEW_AUTHOR
-- CODEX_EXEC_BIN, CODEX_EXEC_TIMEOUT, CODEX_EXEC_MODEL, CODEX_EXEC_EXTRA_ARGS
-- MEEGLE_PROJECT_KEY, MEEGLE_WORK_ITEM_TYPE, MEEGLE_BIN, MEEGLE_AUTO_CREATE, MEEGLE_SEVERITY_MAP
+- AUTO_SEND_LARK
+- CODEX_SDK_MODEL, CODEX_SDK_SANDBOX, CODEX_SDK_TIMEOUT, CODEX_SDK_MAX_DIFF_CHARS
+- LARK_BASE_ENABLED, LARK_BASE_TOKEN, LARK_BASE_TABLE_ID, LARK_CLI_BIN
 - LARK_MESSAGE_TYPE（post 或 interactive）
 - REVIEW_RANGE（yesterday 或 incremental，默认 yesterday；周更建议 incremental）
 - DAILY_REVIEW_RANGE（默认 yesterday）
@@ -155,7 +154,7 @@ Meegle 自动建缺陷
 - GITLAB_HOST, GITLAB_PROTOCOL, GITLAB_AUTH, SYNC_FROM_GITLAB
 - LARK_WEBHOOK_URL
 
-运行预览（不创建 PR/评论）
+运行预览（不发送 Lark，不写 Base）
 - ./scripts/daily_review.sh --dry
 - MAX_REVIEWS_PER_RUN（0 表示不限制）
 
@@ -166,11 +165,13 @@ Meegle 自动建缺陷
 - config/settings.env：本地真实运行配置，已忽略
 - config/repos.txt：本地真实仓白名单，已忽略
 - config/lark_user_map.tsv：本地真实用户映射，已忽略
-- scripts/daily_review.sh：按 daily/weekly 配置创建拉取请求并触发 Codex 审查
-- scripts/init_repos.sh：首次建仓与同步（不创建 PR / 评论）
+- scripts/daily_review.sh：按 daily/weekly 配置运行本地 Codex SDK 审查
+- scripts/init_repos.sh：首次建仓与同步
 - scripts/sync_gogs_repos.sh：从 Gogs 拉取仓库列表并写入 REPOS_FILE
 - scripts/send_lark_report.sh：发送 Lark 报告
-- scripts/build_review_dashboard.sh：从历史 run 记录和 GitHub PR 状态生成静态 review 状态页
+- scripts/build_review_dashboard.sh：从本地 review artifact 生成静态 review 状态页
+- scripts/lib/local_codex_review.py：Codex SDK 本地审查入口
+- scripts/lib/lark_base_issue.py：把本地审查问题 upsert 到 Lark Base
 - templates/AGENTS.md：放在每个镜像仓库根目录
 
 Review 状态页
@@ -193,7 +194,7 @@ GitLab 鉴权格式
 - GITLAB_AUTH 形如 user:token
 
 同步说明
-- SYNC_FROM_GITLAB=1 时，会从 GitLab 拉取指定分支并推送到 GitHub 镜像
+- SYNC_FROM_GITLAB=1 时，会从 GitLab 拉取指定分支；默认本地 SDK 审查不需要再推送审计分支或创建 PR。
 
 镜像仓库要求
 - GitHub 仓库若不存在会自动新建（需 gh 有组织建仓权限）

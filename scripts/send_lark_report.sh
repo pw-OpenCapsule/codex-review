@@ -10,11 +10,67 @@ load_settings "$ROOT_DIR"
 
 ensure_dirs
 
-ensure_gh_auth
+usage() {
+  cat <<'EOF'
+Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n] [--force|-f]
+  REPORT_DATE           指定报告日期（默认今天）
+  --dry, --dry-run, -n   发送到测试 webhook；Lark Base 只 dry-run
+  --force, -f            保留兼容参数；本地 artifact 模式不会写 PR 标记
+EOF
+}
 
+DATE_INPUT=""
+LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
+FORCE_RESEND="${FORCE_RESEND:-0}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry|--dry-run|-n)
+      LARK_DRY_RUN=1
+      ;;
+    --force|-f)
+      FORCE_RESEND=1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$DATE_INPUT" ]]; then
+        DATE_INPUT="$arg"
+      else
+        die "未知参数：$arg"
+      fi
+      ;;
+  esac
+done
+
+date_days_ago() {
+  local days="$1"
+
+  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
+    TZ="$TZ" date -d "$days day ago" +%F
+  else
+    TZ="$TZ" date -v-"${days}"d +%F
+  fi
+}
+
+TODAY="$(TZ="$TZ" date +%F)"
+TODAY_DOW="$(TZ="$TZ" date +%u)"
+TARGET_ENTRY="${RETRY_ONLY:-}"
+ALLOW_ANY_DATE=0
+REPORT_DATES=()
 REPO_KEYS=()
 REPO_CADENCES=()
-SUMMARY_FAILURES=()
+
+if [[ -n "$DATE_INPUT" ]]; then
+  REPORT_DATES=("$DATE_INPUT")
+  ALLOW_ANY_DATE=1
+elif [[ "$TODAY_DOW" -eq 1 ]]; then
+  REPORT_DATES=("$(date_days_ago 2)" "$(date_days_ago 1)" "$TODAY")
+else
+  REPORT_DATES=("$TODAY")
+fi
 
 set_repo_cadence() {
   local key="$1"
@@ -78,57 +134,294 @@ repo_cadence_for() {
   printf '%s' "$cadence"
 }
 
-add_summary_failure() {
-  local entry="$1"
-  SUMMARY_FAILURES+=("$entry")
+should_send_report_date() {
+  local report_date="$1"
+
+  if (( ALLOW_ANY_DATE )); then
+    return 0
+  fi
+
+  if [[ "$report_date" == "$TODAY" ]]; then
+    return 0
+  fi
+
+  if [[ "$TODAY_DOW" -eq 1 ]]; then
+    local saturday sunday
+    saturday="$(date_days_ago 2)"
+    sunday="$(date_days_ago 1)"
+    [[ "$report_date" == "$saturday" || "$report_date" == "$sunday" ]]
+    return
+  fi
+
+  return 1
 }
 
-send_summary_alert_dry() {
-  local count="${#SUMMARY_FAILURES[@]}"
-  local title
-  local content
-  local response
-  local http_code
-  local body
-  local webhook_url
-
-  if (( count == 0 )); then
+resolve_lark_webhook() {
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
+      die "LARK_WEBHOOK_URL_DRY 为空"
+    fi
+    printf '%s' "$LARK_WEBHOOK_URL_DRY"
     return 0
   fi
 
-  if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
-    log "LARK_WEBHOOK_URL_DRY 为空，跳过 summary 告警"
+  if [[ -z "${LARK_WEBHOOK_URL:-}" ]]; then
+    die "LARK_WEBHOOK_URL 为空"
+  fi
+  printf '%s' "$LARK_WEBHOOK_URL"
+}
+
+check_lark_response() {
+  local body="$1"
+
+  RESPONSE_BODY="$body" python3 - <<'PY'
+import json
+import os
+import sys
+
+raw = os.environ.get("RESPONSE_BODY", "").strip()
+if not raw:
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.exit(0)
+code = data.get("code")
+if code is None:
+    code = data.get("StatusCode")
+if code is None:
+    sys.exit(0)
+try:
+    code = int(code)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if code == 0 else 1)
+PY
+}
+
+build_payload() {
+  local title="$1"
+  local content="$2"
+
+  TITLE="$title" REPORT_CONTENT="$content" python3 - <<'PY'
+import json
+import os
+import re
+
+title = os.environ["TITLE"]
+content = os.environ.get("REPORT_CONTENT", "").strip() or "暂无审计结果。"
+message_type = os.environ.get("LARK_MESSAGE_TYPE", "card_v2").strip()
+
+
+def build_post_payload(title, content):
+    elements = []
+    for line in content.splitlines():
+        elements.append([{"tag": "text", "text": line or " "}])
+    return {
+        "msg_type": "post",
+        "content": {"post": {"zh_cn": {"title": title, "content": elements}}},
+    }
+
+
+def build_card_payload(title, content):
+    date = ""
+    repo = ""
+    match = re.match(r"^(.+?)代码审查报告（([^）]+)）\s*-\s*(.+)$", title)
+    if match:
+        date = match.group(2).strip()
+        repo = match.group(3).strip()
+
+    issue_count = len(re.findall(r"^- ", content, flags=re.M))
+    sev_matches = [m.group(0) for m in re.finditer(r"\bP[0-5]\b", content)]
+    max_sev = min(sev_matches, key=lambda item: int(item[1])) if sev_matches else ""
+    color = {
+        "P0": "red",
+        "P1": "orange",
+        "P2": "yellow",
+        "P3": "blue",
+        "P4": "green",
+        "P5": "neutral",
+    }.get(max_sev, "blue")
+
+    overview = []
+    if repo:
+        overview.append(f"**仓库**：`{repo}`")
+    if date:
+        overview.append(f"**日期**：{date}")
+    if issue_count:
+        overview.append(f"**风险**：<text_tag color='{color}'>{issue_count} 项</text_tag>")
+
+    elements = []
+    if overview:
+        elements.append({"tag": "markdown", "content": "\n".join(overview), "text_size": "normal"})
+        elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": content})
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
+            "body": {"elements": elements},
+        },
+    }
+
+
+if message_type == "post":
+    payload = build_post_payload(title, content)
+else:
+    payload = build_card_payload(title, content)
+print(json.dumps(payload))
+PY
+}
+
+use_rich_tags=0
+case "${LARK_MESSAGE_TYPE:-card_v2}" in
+  card|card_v2|interactive_v2) use_rich_tags=1 ;;
+esac
+
+render_local_artifact_content() {
+  local artifact_json="$1"
+  local use_rich="$2"
+
+  ARTIFACT_JSON="$artifact_json" USE_RICH_TAGS="$use_rich" python3 - <<'PY'
+import json
+import os
+import sys
+
+path = os.environ["ARTIFACT_JSON"]
+use_rich = os.environ.get("USE_RICH_TAGS") == "1"
+data = json.load(open(path, encoding="utf-8"))
+issues = data.get("issues") or []
+if not issues:
+    sys.exit(2)
+
+colors = {"P0": "red", "P1": "orange", "P2": "yellow", "P3": "blue", "P4": "green", "P5": "neutral"}
+lines = ["【发现】", ""]
+for issue in issues:
+    sev = (issue.get("severity") or "P5").upper()
+    summary = issue.get("summary_zh") or issue.get("summary") or ""
+    file = issue.get("file") or ""
+    start = issue.get("line_start") or 0
+    end = issue.get("line_end") or start
+    location = file
+    if file and start:
+        location = f"{file}:{start}"
+        if end and end != start:
+            location += f"-{end}"
+    label = f"<text_tag color='{colors.get(sev, 'neutral')}'>{sev}</text_tag>" if use_rich else f"[{sev}]"
+    line = f"- {label} {summary}"
+    if location:
+        line += f"（位置: {location}）"
+    owner = issue.get("owner_lark_id") or issue.get("lark_owner") or ""
+    if owner:
+        line += f"（疑似责任人：<at id={owner}></at>）"
+    lines.append(line)
+    evidence = issue.get("evidence") or ""
+    if evidence:
+        lines.append(f"  证据：{evidence}")
+print("\n".join(lines))
+PY
+}
+
+upsert_lark_base_from_artifact() {
+  local artifact_json="$1"
+
+  if [[ "${LARK_BASE_ENABLED:-0}" != "1" ]]; then
     return 0
   fi
 
-  title="审计告警：summary 接口异常（${REPORT_DATE}）"
-  content="summary 接口调用失败 ${count} 项："
-  for entry in "${SUMMARY_FAILURES[@]}"; do
-    content+=$'\n'"- $entry"
-  done
+  local dry_arg=()
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    dry_arg=(--dry-run)
+  fi
 
+  if python3 "$SCRIPT_DIR/lib/lark_base_issue.py" --artifact "$artifact_json" "${dry_arg[@]}" \
+      >>"$RUN_DIR/lark-base-$REPORT_DATE.log" 2>&1; then
+    log "Lark Base 已处理：$artifact_json"
+  else
+    log "Lark Base 写入失败：${artifact_json}（详见 ${RUN_DIR}/lark-base-${REPORT_DATE}.log）"
+  fi
+}
+
+process_local_artifact_entry() {
+  local report_date="$1"
+  local gitlab_path="$2"
+  local branch="$3"
+  local gh_repo="$4"
+  local base_sha="$5"
+  local head_sha="$6"
+  local artifact_json="$7"
+  local artifact_md="$8"
+  local cadence report_label report_marker title content payload webhook_url response http_code body
+  local repo_slug report_text_file report_payload_file
+
+  [[ -z "$gh_repo" ]] && gh_repo="$(github_repo "$gitlab_path")"
+  [[ -z "$artifact_json" ]] && return 1
+
+  if [[ ! -f "$artifact_json" ]]; then
+    log "本地 review artifact 不存在，跳过：$artifact_json"
+    return 1
+  fi
+
+  cadence="$(repo_cadence_for "$gitlab_path" "$branch")"
+  report_label="$(cadence_title_label "$cadence")"
+  report_marker="$(cadence_report_label "$cadence")"
+
+  if [[ "$cadence" == "daily" && "$TODAY_DOW" -ge 6 && "$report_date" == "$TODAY" ]]; then
+    log "周末日报延后到周一发送：${gitlab_path}@${branch}"
+    return 0
+  fi
+
+  if ! content="$(render_local_artifact_content "$artifact_json" "$use_rich_tags")"; then
+    log "审查无风险项，跳过发送：${gitlab_path}@${branch}"
+    return 0
+  fi
+
+  if [[ -n "${REVIEW_DASHBOARD_URL:-}" ]]; then
+    content+=$'\n<br>\n<br>\n'
+    content+="Review 状态页：${REVIEW_DASHBOARD_URL}"
+  fi
+
+  title="${report_label}代码审查报告（${report_date}） - ${gitlab_path}@${branch}"
   payload="$(build_payload "$title" "$content")"
-  response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$LARK_WEBHOOK_URL_DRY")"
+
+  repo_slug="${gitlab_path//\//_}-${branch//\//-}"
+  report_text_file="$RUN_DIR/report-$report_date-$repo_slug.txt"
+  report_payload_file="$RUN_DIR/report-$report_date-$repo_slug.json"
+  printf '%s' "$content" > "$report_text_file"
+  printf '%s' "$payload" > "$report_payload_file"
+
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    log "DRY_RUN=1，已生成报告：$report_text_file"
+    log "DRY_RUN=1，已生成 payload：$report_payload_file"
+    cat "$report_text_file"
+  fi
+
+  webhook_url="$(resolve_lark_webhook)"
+  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
+    log "DRY_RUN=1，使用测试 webhook 发送"
+  fi
+
+  response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$webhook_url")"
   http_code="${response##*$'\n'}"
   body="${response%$'\n'*}"
 
   if [[ "$http_code" != "200" ]]; then
-    log "summary 告警发送失败（HTTP ${http_code}）"
-    if [[ -n "$body" ]]; then
-      log "Lark 响应: $body"
-    fi
+    log "Lark 发送失败（HTTP ${http_code}），跳过：${gitlab_path}@${branch}"
+    [[ -n "$body" ]] && log "Lark 响应: $body"
     return 1
   fi
 
   if ! check_lark_response "$body"; then
-    log "summary 告警返回错误"
-    if [[ -n "$body" ]]; then
-      log "Lark 响应: $body"
-    fi
+    log "Lark 返回错误，跳过：${gitlab_path}@${branch}"
+    [[ -n "$body" ]] && log "Lark 响应: $body"
     return 1
   fi
 
-  log "summary 告警已发送（dry webhook）"
+  upsert_lark_base_from_artifact "$artifact_json"
+  log "已发送${report_marker}：${gitlab_path}@${branch}（${base_sha:0:8}..${head_sha:0:8}）"
+  sent_any=1
 }
 
 refresh_review_dashboard() {
@@ -149,1627 +442,7 @@ refresh_review_dashboard() {
   fi
 }
 
-usage() {
-  cat <<'EOF'
-Usage: send_lark_report.sh [REPORT_DATE] [--dry|--dry-run|-n] [--force|-f]
-  REPORT_DATE          指定报告日期（默认今天）
-  --dry, --dry-run, -n  发送到测试 webhook（不写 PR 标记）
-  --force, -f           强制重发（忽略“已发送”标记）
-EOF
-}
-
-DATE_INPUT=""
-LARK_DRY_RUN="${LARK_DRY_RUN:-0}"
-FORCE_RESEND="${FORCE_RESEND:-0}"
-declare -a ISSUES_FOR_MEEGLE=()
-for arg in "$@"; do
-  case "$arg" in
-    --dry|--dry-run|-n)
-      LARK_DRY_RUN=1
-      ;;
-    --force|-f)
-      FORCE_RESEND=1
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      if [[ -z "$DATE_INPUT" ]]; then
-        DATE_INPUT="$arg"
-      else
-        die "未知参数：$arg"
-      fi
-      ;;
-  esac
-done
-
-date_days_ago() {
-  local days="$1"
-
-  if TZ="$TZ" date -d "$days day ago" +%F >/dev/null 2>&1; then
-    TZ="$TZ" date -d "$days day ago" +%F
-  else
-    TZ="$TZ" date -v-"${days}"d +%F
-  fi
-}
-
-TODAY="$(TZ="$TZ" date +%F)"
-TODAY_DOW="$(TZ="$TZ" date +%u)"
-TARGET_ENTRY="${RETRY_ONLY:-}"
-SELF_GH_LOGIN="${SELF_GH_LOGIN:-}"
-SUMMARY_RETRY_COUNT="${SUMMARY_RETRY_COUNT:-3}"
-SUMMARY_RETRY_DELAY_SECONDS="${SUMMARY_RETRY_DELAY_SECONDS:-2}"
-ALLOW_ANY_DATE=0
-REPORT_DATES=()
-
-if [[ -n "$DATE_INPUT" ]]; then
-  REPORT_DATES=("$DATE_INPUT")
-  ALLOW_ANY_DATE=1
-elif [[ "$TODAY_DOW" -eq 1 ]]; then
-  REPORT_DATES=("$(date_days_ago 2)" "$(date_days_ago 1)" "$TODAY")
-else
-  REPORT_DATES=("$TODAY")
-fi
-
-if [[ -z "$SELF_GH_LOGIN" ]]; then
-  SELF_GH_LOGIN="$(gh api user --jq '.login' 2>/dev/null || true)"
-fi
-
-should_send_report_date() {
-  local report_date="$1"
-
-  if (( ALLOW_ANY_DATE )); then
-    return 0
-  fi
-
-  if [[ "$report_date" == "$TODAY" ]]; then
-    return 0
-  fi
-
-  if [[ "$TODAY_DOW" -eq 1 ]]; then
-    local saturday
-    local sunday
-    saturday="$(date_days_ago 2)"
-    sunday="$(date_days_ago 1)"
-    if [[ "$report_date" == "$saturday" || "$report_date" == "$sunday" ]]; then
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
 load_repo_cadences
-
-report_already_sent() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local already
-
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | (contains("已发送周报") or contains("已发送日报"))] | any')"
-  [[ "$already" == "true" ]]
-}
-
-normalize_for_pr_comment() {
-  local text="$1"
-
-  REPORT_TEXT="$text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REPORT_TEXT", "")
-if not text.strip():
-    raise SystemExit(0)
-
-text = text.replace("\r\n", "\n")
-text = re.sub(r"<text_tag[^>]*>(.*?)</text_tag>", r"[\1]", text)
-text = re.sub(r"<at[^>]*></at>", "", text)
-text = re.sub(r"<[^>]+>", "", text)
-
-lines = []
-for line in text.splitlines():
-    stripped = line.strip()
-    if not stripped:
-        lines.append("")
-        continue
-    if stripped in ("责任人:", "责任人：", "责任人"):
-        continue
-    lines.append(line.rstrip())
-
-print("\n".join(lines).strip())
-PY
-}
-
-post_report_comment() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local content="$3"
-  local marker="$4"
-  local normalized
-
-  normalized="$(normalize_for_pr_comment "$content")"
-  if [[ -z "$(printf '%s' "$normalized" | tr -d '[:space:]')" ]]; then
-    normalized="审查结果已发送。"
-  fi
-
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "$normalized" >/dev/null
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "$marker" >/dev/null
-}
-
-codex_setup_required() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REVIEW_TEXT", "")
-if re.search(r"To use Codex here,", text, flags=re.IGNORECASE):
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-codex_usage_limited() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REVIEW_TEXT", "")
-patterns = [
-    r"codex usage limits have been reached",
-    r"usage limits have been reached",
-    r"increase the limits by adding credits",
-    r"流量不足",
-    r"额度不足",
-    r"配额不足",
-    r"额度用尽",
-    r"用量已达上限",
-    r"达到使用上限",
-]
-for pat in patterns:
-    if re.search(pat, text, flags=re.IGNORECASE):
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-review_has_no_issues() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REVIEW_TEXT", "")
-patterns = [
-    r"didn't find any major issues",
-    r"no major issues",
-    r"no issues found",
-    r"looks good to me",
-]
-for pat in patterns:
-    if re.search(pat, text, flags=re.IGNORECASE):
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-fetch_pr_commit_lines() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local limit="${3:-10}"
-  local json
-
-  if [[ -z "$gh_repo" || -z "$pr_number" ]]; then
-    return 1
-  fi
-  if [[ "$limit" -le 0 ]]; then
-    return 1
-  fi
-
-  json="$(gh api "repos/$gh_repo/pulls/$pr_number/commits?per_page=$limit" 2>/dev/null || true)"
-  if [[ -z "$json" ]]; then
-    return 1
-  fi
-
-  COMMITS_JSON="$json" python3 - <<'PY'
-import json
-import os
-
-raw = os.environ.get("COMMITS_JSON", "")
-if not raw.strip():
-    raise SystemExit(1)
-
-try:
-    data = json.loads(raw)
-except Exception:
-    raise SystemExit(1)
-
-lines = []
-for item in data:
-    sha = (item.get("sha") or "")[:7]
-    commit = item.get("commit") or {}
-    msg = (commit.get("message") or "").splitlines()[0].strip()
-    author = (commit.get("author") or {}).get("name") or ""
-    if not msg:
-        continue
-    if author:
-        lines.append(f"{sha} {author} {msg}")
-    else:
-        lines.append(f"{sha} {msg}")
-
-if not lines:
-    raise SystemExit(1)
-
-print("\n".join(lines))
-PY
-}
-
-fetch_pr_authors_tsv() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local lines
-
-  if [[ -z "$gh_repo" || -z "$pr_number" ]]; then
-    return 1
-  fi
-
-  lines="$(gh api --paginate "repos/$gh_repo/pulls/$pr_number/commits?per_page=100" \
-    --jq '.[] | [.commit.author.name, .commit.author.email] | @tsv' 2>/dev/null || true)"
-  if [[ -z "$lines" ]]; then
-    return 1
-  fi
-
-  AUTHOR_LINES="$lines" python3 - <<'PY'
-import os
-from collections import Counter
-
-raw = os.environ.get("AUTHOR_LINES", "")
-if not raw.strip():
-    raise SystemExit(1)
-
-counts = Counter()
-meta = {}
-for line in raw.splitlines():
-    parts = line.split("\t")
-    name = parts[0].strip() if parts else ""
-    email = parts[1].strip() if len(parts) > 1 else ""
-    key = (email or name).strip().lower()
-    if not key:
-        continue
-    counts[key] += 1
-    if key not in meta:
-        meta[key] = (name, email)
-
-if not counts:
-    raise SystemExit(1)
-
-for key, count in counts.most_common():
-    name, email = meta.get(key, ("", ""))
-    print(f"{name}\t{email}\t{count}")
-PY
-}
-
-merge_author_tsv() {
-  local author_lines="$1"
-
-  AUTHOR_LINES="$author_lines" python3 - <<'PY'
-import os
-from collections import Counter
-
-raw = os.environ.get("AUTHOR_LINES", "")
-if not raw.strip():
-    raise SystemExit(1)
-
-counts = Counter()
-meta = {}
-for line in raw.splitlines():
-    parts = line.split("\t")
-    name = parts[0].strip() if parts else ""
-    email = parts[1].strip() if len(parts) > 1 else ""
-    raw_count = parts[2].strip() if len(parts) > 2 else "1"
-    try:
-        count = int(raw_count)
-    except ValueError:
-        count = 1
-    key = (email or name).strip().lower()
-    if not key:
-        continue
-    counts[key] += count
-    if key not in meta:
-        meta[key] = (name, email)
-
-if not counts:
-    raise SystemExit(1)
-
-for key, count in counts.most_common():
-    name, email = meta.get(key, ("", ""))
-    print(f"{name}\t{email}\t{count}")
-PY
-}
-
-resolve_lark_webhook() {
-  if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
-    if [[ -z "${LARK_WEBHOOK_URL_DRY:-}" ]]; then
-      die "LARK_WEBHOOK_URL_DRY 为空"
-    fi
-    printf '%s' "$LARK_WEBHOOK_URL_DRY"
-    return 0
-  fi
-
-  if [[ -z "$LARK_WEBHOOK_URL" ]]; then
-    die "LARK_WEBHOOK_URL 为空"
-  fi
-  printf '%s' "$LARK_WEBHOOK_URL"
-}
-
-check_lark_response() {
-  local body="$1"
-
-  RESPONSE_BODY="$body" python3 - <<'PY'
-import json
-import os
-import re
-import sys
-
-raw = os.environ.get("RESPONSE_BODY", "").strip()
-if not raw:
-    sys.exit(0)
-
-try:
-    data = json.loads(raw)
-except Exception:
-    sys.exit(0)
-
-code = data.get("code")
-if code is None:
-    code = data.get("StatusCode")
-
-if code is None:
-    sys.exit(0)
-
-try:
-    code = int(code)
-except Exception:
-    sys.exit(1)
-
-sys.exit(0 if code == 0 else 1)
-PY
-}
-
-review_contains_severity() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REVIEW_TEXT", "")
-if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
-    raise SystemExit(0)
-if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-trigger_codex_review() {
-  local gh_repo="$1"
-  local pr_number="$2"
-
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "$CODEX_PROMPT (retry $(date +'%F %T'))" >/dev/null
-}
-
-schedule_retry() {
-  local gitlab_path="$1"
-  local branch="$2"
-  local gh_repo="$3"
-  local pr_number="$4"
-  local delay="${RETRY_DELAY_SECONDS:-1800}"
-  local repo_slug="${gitlab_path//\//_}-${branch//\//-}"
-  local retry_file="$RUN_DIR/retry-$REPORT_DATE-$repo_slug.tsv"
-  local now_ts next_ts attempt existing_ts
-
-  now_ts="$(date +%s)"
-  next_ts=$((now_ts + delay))
-  attempt=1
-
-  if [[ -f "$retry_file" ]]; then
-    IFS=$'\t' read -r existing_ts attempt _ _ _ < "$retry_file" || true
-    if [[ -n "$existing_ts" && "$existing_ts" -ge "$now_ts" ]]; then
-      log "已存在重试计划，跳过重复调度：$gitlab_path@$branch"
-      return 1
-    fi
-    if [[ -n "${attempt:-}" ]]; then
-      attempt=$((attempt + 1))
-    fi
-  fi
-
-  printf '%s\t%s\t%s\t%s\t%s\n' "$next_ts" "$attempt" "$gitlab_path" "$branch" "$pr_number" > "$retry_file"
-
-  local delay_seconds=$((next_ts - now_ts))
-  if [[ "$delay_seconds" -lt 0 ]]; then
-    delay_seconds=0
-  fi
-
-  (
-    sleep "$delay_seconds"
-    cd "$ROOT_DIR"
-    RETRY_ONLY="${gitlab_path}@${branch}" ./scripts/send_lark_report.sh "$REPORT_DATE"
-  ) >> "$RUN_DIR/retry-$REPORT_DATE-$repo_slug.log" 2>&1 &
-
-  log "已安排 ${delay_seconds}s 后重试发送：$gitlab_path@$branch"
-  return 0
-}
-
-strip_urls() {
-  sed -E 's#https?://[^ )]+##g'
-}
-
-extract_location() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-import sys
-
-text = os.environ.get("REVIEW_TEXT", "")
-m2 = re.search(r"^CODEX_LOCATION\t([0-9a-fA-F]{7,40})\t([^\t]+)\t(\d+)\t(\d+)$", text, flags=re.M)
-if m2:
-    commit = m2.group(1)
-    path = m2.group(2)
-    start = m2.group(3)
-    end = m2.group(4)
-    print(f"{commit}\t{path}\t{start}\t{end}")
-    sys.exit(0)
-m = re.search(r"https?://github.com/[^\s)]+/blob/([0-9a-fA-F]{7,40})/([^#\s)]+)#L(\d+)(?:-L(\d+))?", text)
-if not m:
-    sys.exit(0)
-
-commit = m.group(1)
-path = m.group(2)
-start = m.group(3)
-end = m.group(4) or start
-print(f"{commit}\t{path}\t{start}\t{end}")
-PY
-}
-
-get_code_snippet() {
-  local repo_dir="$1"
-  local commit="$2"
-  local path="$3"
-  local start="$4"
-  local end="$5"
-  local branch="$6"
-  local content=""
-  local context="${SNIPPET_CONTEXT:-3}"
-
-  if [[ ! -d "$repo_dir/.git" ]]; then
-    return 1
-  fi
-
-  if [[ -n "$commit" ]] && git -C "$repo_dir" cat-file -e "$commit:$path" 2>/dev/null; then
-    content="$(git -C "$repo_dir" show "$commit:$path")"
-  elif git -C "$repo_dir" cat-file -e "origin/$branch:$path" 2>/dev/null; then
-    content="$(git -C "$repo_dir" show "origin/$branch:$path")"
-  elif git -C "$repo_dir" cat-file -e "HEAD:$path" 2>/dev/null; then
-    content="$(git -C "$repo_dir" show "HEAD:$path")"
-  else
-    return 1
-  fi
-
-  if [[ -z "$content" ]]; then
-    return 1
-  fi
-
-  if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
-    if [[ ! "$context" =~ ^[0-9]+$ ]]; then
-      context=0
-    fi
-    local start_num="$start"
-    local end_num="$end"
-    local adj_start=$((start_num - context))
-    local adj_end=$((end_num + context))
-    if (( adj_start < 1 )); then
-      adj_start=1
-    fi
-    printf '%s\n' "$content" | sed -n "${adj_start},${adj_end}p"
-    return 0
-  fi
-
-  printf '%s\n' "$content" | sed -n "${start},${end}p"
-}
-
-get_blame_authors() {
-  local repo_dir="$1"
-  local commit="$2"
-  local path="$3"
-  local start="$4"
-  local end="$5"
-  local branch="$6"
-  local ref=""
-
-  if [[ ! -d "$repo_dir/.git" ]]; then
-    return 1
-  fi
-
-  if [[ -n "$commit" ]] && git -C "$repo_dir" cat-file -e "$commit^{commit}" 2>/dev/null; then
-    ref="$commit"
-  elif git -C "$repo_dir" rev-parse -q --verify "origin/$branch" >/dev/null 2>&1; then
-    ref="origin/$branch"
-  else
-    ref="HEAD"
-  fi
-
-  if ! git -C "$repo_dir" cat-file -e "$ref:$path" 2>/dev/null; then
-    return 1
-  fi
-
-  REPO_DIR="$repo_dir" REF="$ref" PATH_FILE="$path" START="$start" END="$end" python3 - <<'PY'
-import os
-import subprocess
-from collections import Counter
-
-repo = os.environ["REPO_DIR"]
-ref = os.environ["REF"]
-path = os.environ["PATH_FILE"]
-start = os.environ["START"]
-end = os.environ["END"]
-
-cmd = [
-    "git", "-C", repo, "blame",
-    "-w", "-M", "-C",
-    "--line-porcelain",
-    "-L", f"{start},{end}",
-    ref, "--", path
-]
-res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-if res.returncode != 0:
-    raise SystemExit(1)
-
-counts = Counter()
-names = {}
-current_name = ""
-current_email = ""
-
-for line in res.stdout.splitlines():
-    if line.startswith("author "):
-        current_name = line[len("author "):].strip()
-    elif line.startswith("author-mail "):
-        current_email = line[len("author-mail "):].strip().strip("<>")
-    elif line.startswith("\t"):
-        key = (current_email or current_name).strip()
-        if key:
-            counts[key] += 1
-            names[key] = (current_name.strip(), current_email.strip())
-        current_name = ""
-        current_email = ""
-
-for key, count in counts.most_common():
-    name, email = names.get(key, ("", ""))
-    print(f"{name}\t{email}\t{count}")
-PY
-}
-
-lookup_lark_id() {
-  local email="$1"
-  local name="$2"
-  local map_path="${LARK_USER_MAP:-$ROOT_DIR/config/lark_user_map.tsv}"
-
-  if [[ ! -f "$map_path" ]]; then
-    return 1
-  fi
-
-  EMAIL="$email" NAME="$name" MAP_PATH="$map_path" python3 - <<'PY'
-import os
-
-email = (os.environ.get("EMAIL") or "").strip().lower()
-name = (os.environ.get("NAME") or "").strip().lower()
-path = os.environ["MAP_PATH"]
-
-with open(path, "r", encoding="utf-8") as fh:
-    for raw in fh:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "\t" in line:
-            parts = line.split("\t", 1)
-        else:
-            parts = line.split(None, 1)
-        if len(parts) < 2:
-            continue
-        git_key = parts[0].strip().lower()
-        lark_id = parts[1].split()[0].strip()
-        if not lark_id:
-            continue
-        if email and email == git_key:
-            print(lark_id)
-            raise SystemExit(0)
-        if name and name == git_key:
-            print(lark_id)
-            raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-format_mention_line() {
-  local authors_tsv="$1"
-  local label="${2:-责任人}"
-  local max_mentions="${LARK_MENTION_MAX:-3}"
-  local mentions=()
-  local count=0
-
-  while IFS=$'\t' read -r author_name author_email author_lines; do
-    [[ -z "$author_name" && -z "$author_email" ]] && continue
-    if [[ "$count" -ge "$max_mentions" ]]; then
-      break
-    fi
-    lark_id="$(lookup_lark_id "$author_email" "$author_name" || true)"
-    if [[ -n "$lark_id" ]]; then
-      mentions+=("<at id=${lark_id}></at>")
-    else
-      display="$author_name"
-      if [[ -z "$display" ]]; then
-        display="$author_email"
-      fi
-      if [[ -n "$author_email" && "$author_email" != "$display" ]]; then
-        display="$display ($author_email)"
-      fi
-      if [[ -n "$display" ]]; then
-        mentions+=("@${display}")
-      fi
-    fi
-    count=$((count + 1))
-  done <<< "$authors_tsv"
-
-  if [[ "${#mentions[@]}" -eq 0 ]]; then
-    return 1
-  fi
-
-  local joined=""
-  local mention=""
-  for mention in "${mentions[@]}"; do
-    if [[ -z "$joined" ]]; then
-      joined="$mention"
-    else
-      joined="$joined, $mention"
-    fi
-  done
-  printf '%s: %s' "$label" "$joined"
-}
-
-format_single_mention() {
-  local label="$1"
-  local name="$2"
-  local email="$3"
-  local display=""
-  local lark_id=""
-
-  lark_id="$(lookup_lark_id "$email" "$name" || true)"
-  if [[ -n "$lark_id" ]]; then
-    printf '**%s**：<at id=%s></at>' "$label" "$lark_id"
-    return 0
-  fi
-
-  display="$name"
-  if [[ -z "$display" ]]; then
-    display="$email"
-  fi
-  if [[ -n "$email" && "$email" != "$display" ]]; then
-    display="$display ($email)"
-  fi
-  if [[ -n "$display" ]]; then
-    printf '**%s**：@%s' "$label" "$display"
-    return 0
-  fi
-
-  return 1
-}
-
-code_lang() {
-  local path="$1"
-  local ext="${path##*.}"
-
-  case "$ext" in
-    dart) echo "dart" ;;
-    js) echo "javascript" ;;
-    jsx) echo "javascript" ;;
-    ts) echo "typescript" ;;
-    tsx) echo "typescript" ;;
-    py) echo "python" ;;
-    go) echo "go" ;;
-    java) echo "java" ;;
-    kt) echo "kotlin" ;;
-    swift) echo "swift" ;;
-    rb) echo "ruby" ;;
-    php) echo "php" ;;
-    c) echo "c" ;;
-    cc|cpp|cxx|hpp|hxx|hh) echo "cpp" ;;
-    h) echo "c" ;;
-    cs) echo "c_sharp" ;;
-    m) echo "objective_c" ;;
-    json) echo "json" ;;
-    yml|yaml) echo "yaml" ;;
-    sh|bash|zsh) echo "bash" ;;
-    sql) echo "sql" ;;
-    md) echo "markdown" ;;
-    toml) echo "toml" ;;
-    xml) echo "xml" ;;
-    html|htm) echo "html" ;;
-    css) echo "css" ;;
-    scss) echo "scss" ;;
-    *) echo "plain_text" ;;
-  esac
-}
-
-get_review_text() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local pr_json
-  local review_comments_json
-
-  pr_json="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments,reviews)"
-  review_comments_json="$(gh api "repos/$gh_repo/pulls/$pr_number/comments" 2>/dev/null || printf '[]')"
-
-  REVIEW_IGNORE_AUTHORS="${REVIEW_IGNORE_AUTHORS:-$SELF_GH_LOGIN}" \
-  CODEX_REVIEW_AUTHOR="${CODEX_REVIEW_AUTHOR:-}" CODEX_PROMPT="${CODEX_PROMPT:-}" PR_JSON="$pr_json" \
-  REVIEW_COMMENTS_JSON="$review_comments_json" \
-  python3 - <<'PY'
-import json
-import os
-import re
-import sys
-
-raw = os.environ.get("PR_JSON", "")
-if not raw.strip():
-    sys.exit(0)
-
-data = json.loads(raw)
-review_comments = json.loads(os.environ.get("REVIEW_COMMENTS_JSON", "[]") or "[]")
-author = os.environ.get("CODEX_REVIEW_AUTHOR") or ""
-prompt = os.environ.get("CODEX_PROMPT") or ""
-ignore_raw = os.environ.get("REVIEW_IGNORE_AUTHORS") or ""
-ignore = {item.strip().lower() for item in ignore_raw.split(",") if item.strip()}
-
-comments = data.get("comments") or []
-reviews = data.get("reviews") or []
-
-def body_text(item):
-    return item.get("body") if isinstance(item, dict) else None
-
-def author_login(item):
-    login = (item.get("author") or {}).get("login") if isinstance(item, dict) else ""
-    return (login or "").lower()
-
-def looks_like_review(text: str) -> bool:
-    if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
-        return True
-    if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
-        return True
-    return "```" in text
-
-def should_skip_text(text: str, prompt_text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return True
-    if prompt_text and prompt_text in text:
-        return True
-    if stripped in ("已发送日报", "已发送周报", "审查结果已发送。", "审查结果已发送"):
-        return True
-    return False
-
-texts = []
-location = None
-if author:
-    for item in comments:
-        if (item.get("author") or {}).get("login") == author:
-            text = body_text(item)
-            if text:
-                if should_skip_text(text, prompt):
-                    continue
-                if author_login(item) in ignore and not looks_like_review(text):
-                    continue
-                texts.append(text)
-    for item in reviews:
-        if (item.get("author") or {}).get("login") == author:
-            text = body_text(item)
-            if text:
-                if should_skip_text(text, prompt):
-                    continue
-                if author_login(item) in ignore and not looks_like_review(text):
-                    continue
-                texts.append(text)
-else:
-    for item in comments:
-        text = body_text(item)
-        if not text:
-            continue
-        if should_skip_text(text, prompt):
-            continue
-        if author_login(item) in ignore and not looks_like_review(text):
-            continue
-        texts.append(text)
-    for item in reviews:
-        text = body_text(item)
-        if text:
-            if should_skip_text(text, prompt):
-                continue
-            if author_login(item) in ignore and not looks_like_review(text):
-                continue
-            texts.append(text)
-
-has_review_text = any(looks_like_review(text) for text in texts)
-for item in review_comments or []:
-    login = ((item.get("user") or {}).get("login") or "").lower()
-    text = item.get("body")
-    if text:
-        if should_skip_text(text, prompt):
-            continue
-        if login and login in ignore and not looks_like_review(text):
-            continue
-        if not has_review_text:
-            texts.append(text)
-    if location is None:
-        path = item.get("path")
-        line = item.get("line") or item.get("original_line") or item.get("position")
-        commit = item.get("commit_id") or item.get("original_commit_id")
-        if path and line and commit:
-            location = (commit, path, str(line), str(line))
-
-if location:
-    texts.append(f"CODEX_LOCATION\t{location[0]}\t{location[1]}\t{location[2]}\t{location[3]}")
-
-print("\n".join(texts))
-PY
-}
-
-fetch_review_comment_locations() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local json
-
-  json="$(gh api "repos/$gh_repo/pulls/$pr_number/comments" 2>/dev/null || true)"
-  if [[ -z "$json" ]]; then
-    return 1
-  fi
-
-  REVIEW_COMMENTS_JSON="$json" python3 - <<'PY'
-import json
-import os
-import re
-import sys
-
-raw = os.environ.get("REVIEW_COMMENTS_JSON", "")
-if not raw.strip():
-    sys.exit(1)
-
-try:
-    data = json.loads(raw)
-except Exception:
-    sys.exit(1)
-
-def is_issue(text: str) -> bool:
-    if re.search(r"\bP[0-5]\b", text, flags=re.IGNORECASE):
-        return True
-    if re.search(r"P[0-5]\s*Badge", text, flags=re.IGNORECASE):
-        return True
-    return "```" in text
-
-for item in data or []:
-    body = (item.get("body") or "").strip()
-    if not body or not is_issue(body):
-        continue
-    path = item.get("path")
-    line = item.get("line") or item.get("original_line") or item.get("position")
-    commit = item.get("commit_id") or item.get("original_commit_id")
-    if path and line and commit:
-        print(f"{commit}\t{path}\t{line}\t{line}")
-PY
-}
-
-collect_issue_snippets() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local branch="$3"
-  local repo_path
-  local locations
-  local snippet
-  local lang
-  local location
-
-  repo_path="$(repo_dir "$gh_repo")"
-  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
-  if [[ -z "$locations" ]]; then
-    return 0
-  fi
-
-  while IFS=$'\t' read -r commit path start end; do
-    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
-    snippet="$(get_code_snippet "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-    if [[ -n "$snippet" ]]; then
-      lang="$(code_lang "$path")"
-      location="${path}:${start}-${end}"
-      printf '%s\037```%s\n%s\n```\0' "$location" "$lang" "$snippet"
-    fi
-  done <<< "$locations"
-}
-
-collect_issue_evidence() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local branch="$3"
-  local repo_path
-  local locations
-  local snippet
-  local snippet_block
-  local blame_authors
-  local responsible_line
-  local lang
-  local location
-
-  repo_path="$(repo_dir "$gh_repo")"
-  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
-  if [[ -z "$locations" ]]; then
-    return 0
-  fi
-
-  while IFS=$'\t' read -r commit path start end; do
-    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
-    location="${path}:${start}-${end}"
-    snippet_block=""
-    responsible_line=""
-
-    snippet="$(get_code_snippet "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-    if [[ -n "$snippet" ]]; then
-      lang="$(code_lang "$path")"
-      snippet_block="$(printf '```%s\n%s\n```' "$lang" "$snippet")"
-    fi
-
-    blame_authors="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-    if [[ -n "$blame_authors" ]]; then
-      responsible_line="$(format_mention_line "$blame_authors" "疑似责任人" || true)"
-    fi
-
-    printf '%s\037%s\037%s\0' "$location" "$snippet_block" "$responsible_line"
-  done <<< "$locations"
-}
-
-collect_issue_blame_authors() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local branch="$3"
-  local repo_path
-  local locations
-  local blame_authors
-  local all_authors=""
-
-  repo_path="$(repo_dir "$gh_repo")"
-  locations="$(fetch_review_comment_locations "$gh_repo" "$pr_number" || true)"
-  if [[ -z "$locations" ]]; then
-    return 1
-  fi
-
-  while IFS=$'\t' read -r commit path start end; do
-    [[ -z "$commit" || -z "$path" || -z "$start" || -z "$end" ]] && continue
-    blame_authors="$(get_blame_authors "$repo_path" "$commit" "$path" "$start" "$end" "$branch" || true)"
-    if [[ -n "$blame_authors" ]]; then
-      all_authors+="$blame_authors"$'\n'
-    fi
-  done <<< "$locations"
-
-  merge_author_tsv "$all_authors"
-}
-summarize_review_with_ai() {
-  local repo="$1"
-  local branch="$2"
-  local pr_number="$3"
-  local review_text="$4"
-  local location="$5"
-
-  local codex_bin="${CODEX_EXEC_BIN:-codex}"
-  if ! command -v "$codex_bin" >/dev/null 2>&1; then
-    return 1
-  fi
-
-  local workdir
-  workdir="$(repo_dir "$(github_repo "$repo")")"
-  if [[ ! -d "$workdir" ]]; then
-    log "codex_review: 镜像目录不存在 ${workdir}，跳过"
-    return 1
-  fi
-
-  local out
-  local sha_for_codex="${pr_head_sha:-HEAD}"
-  if ! out="$(call_codex_review "$(basename "$repo")" "$branch" "$pr_number" "$sha_for_codex" "$workdir" "$review_text" 2>/dev/null)"; then
-    return 1
-  fi
-  if [[ -z "$out" ]]; then
-    return 1
-  fi
-  printf '%s\n' "$out"
-}
-
-# --- legacy python inline (replaced by call_codex_review above) ---
-_summarize_review_with_ai_legacy_DISABLED() {
-  local repo="$1"
-  local branch="$2"
-  local pr_number="$3"
-  local review_text="$4"
-  local location="$5"
-
-  REPO_NAME="$repo" BRANCH_NAME="$branch" PR_NUMBER="$pr_number" REVIEW_TEXT="$review_text" LOCATION="$location" \
-  CODEX_SUMMARY_API="$CODEX_SUMMARY_API" CODEX_SUMMARY_TOKEN="$CODEX_SUMMARY_TOKEN" CODEX_SUMMARY_MODEL="${CODEX_SUMMARY_MODEL:-gpt-4o-mini}" \
-  python3 - <<'PY'
-import json
-import os
-import re
-import sys
-import urllib.request
-import urllib.error
-import re
-
-repo = os.environ["REPO_NAME"]
-branch = os.environ["BRANCH_NAME"]
-pr_number = os.environ["PR_NUMBER"]
-api = os.environ["CODEX_SUMMARY_API"]
-token = os.environ["CODEX_SUMMARY_TOKEN"]
-model = os.environ.get("CODEX_SUMMARY_MODEL", "gpt-4o-mini")
-review_text = os.environ.get("REVIEW_TEXT", "").strip()
-location = os.environ.get("LOCATION", "").strip()
-
-def log_err(message: str) -> None:
-    sys.stderr.write(message.rstrip() + "\n")
-
-def normalize(text: str) -> str:
-    text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
-    text = re.sub(r"(?mi)^To use Codex here,.*$", "", text)
-    text = re.sub(
-        r"To use Codex here, https://chatgpt\\.com/codex/settings/connectors\\.?\\s*",
-        "",
-        text,
-    )
-    text = re.sub(r"(?mi)^###\\s*💡\\s*Codex Review\\s*$", "", text)
-    text = re.sub(r"(?mi)^Here are some automated review suggestions for this pull request\\.?\\s*$", "", text)
-    text = re.sub(r"(?mi)^CODEX_LOCATION\\t.*$", "", text)
-    def repl(m):
-        path = m.group("path")
-        lines = m.group("lines").replace("L", "")
-        return f"{path}:{lines}"
-    text = re.sub(
-        r"https?://github.com/[^\\s)]+/blob/[^/]+/(?P<path>[^#\\s)]+)#(?P<lines>L\\d+(?:-L\\d+)?)",
-        repl,
-        text,
-    )
-    text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
-    text = re.sub(r"https?://\\S+", "", text)
-    return text.strip()
-
-normalized = normalize(review_text)
-has_severity = bool(re.search(r"\bP[0-5]\b", normalized))
-
-system_prompt = """你是代码审计摘要器。请严格输出 JSON（不要额外文字），格式如下：
-{
-  "issues": [
-    {"severity": "P0|P1|P2|P3|P4|P5", "summary": "中文概述"}
-  ]
-}
-要求：
-- 只输出中文，summary 不要包含 URL 或 Markdown 链接
-- summary 可保留字段/函数名，用反引号包裹；不要输出多行代码块或尖括号内容
-- 不要输出 PR 编号或链接
-- 如果原始审查没有明确 P0-P5，则输出 {"issues": []}
-- summary 需保留关键背景与影响，可用 1-3 句"""
-
-user_prompt = f"仓库: {repo}\n分支: {branch}\n位置: {location or '未知'}\n原始审查内容:\n{normalized}"
-
-if not normalized:
-    print(json.dumps({"issues": []}))
-    sys.exit(0)
-
-payload = {
-    "model": model,
-    "temperature": 0.2,
-    "max_tokens": 600,
-    "messages": [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ],
-}
-
-req = urllib.request.Request(
-    api,
-    data=json.dumps(payload).encode("utf-8"),
-    headers={"Content-Type": "application/json", "Authorization": token},
-)
-
-try:
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read().decode("utf-8", "replace")
-except urllib.error.HTTPError as exc:
-    body = exc.read().decode("utf-8", "replace")
-    log_err(f"summary api http error: {exc.code}")
-    if body:
-        log_err(body[:2000])
-    sys.exit(1)
-except urllib.error.URLError as exc:
-    log_err(f"summary api url error: {exc}")
-    sys.exit(1)
-except Exception as exc:
-    log_err(f"summary api error: {exc}")
-    sys.exit(1)
-
-try:
-    data = json.loads(body)
-except Exception as exc:
-    log_err(f"summary api json parse error: {exc}")
-    if body:
-        log_err(body[:2000])
-    sys.exit(1)
-
-content = (
-    data.get("choices", [{}])[0]
-    .get("message", {})
-    .get("content", "")
-    .strip()
-)
-
-if not content:
-    log_err("summary api empty content")
-    sys.exit(1)
-
-def extract_json(raw: str):
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```\\w*\\s*", "", raw)
-        raw = re.sub(r"```$", "", raw.strip())
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(raw[start:end+1])
-        except Exception:
-            return None
-    return None
-
-def has_zh(text: str) -> bool:
-    return bool(re.search(r"[\\u4e00-\\u9fff]", text))
-
-parsed = extract_json(content)
-if not parsed:
-    log_err("summary api invalid json content")
-    log_err(content[:2000])
-    sys.exit(1)
-
-issues = parsed.get("issues") or []
-if has_severity and not issues:
-    log_err("summary api returned empty issues with severity present")
-    sys.exit(1)
-
-if issues and not any(has_zh((i.get("summary") or "")) for i in issues):
-    translate_prompt = """你是中文翻译器。把 issues 中的 summary 翻译成中文，保持 severity 不变。
-严格输出 JSON，格式：
-{"issues":[{"severity":"P0|P1|P2|P3|P4|P5","summary":"中文摘要"}]}
-要求：
-- 保留反引号包裹的字段/函数名，不要翻译反引号内的内容
-- 不要输出其它文字。"""
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "max_tokens": 600,
-        "messages": [
-            {"role": "system", "content": translate_prompt},
-            {"role": "user", "content": json.dumps({"issues": issues}, ensure_ascii=False)},
-        ],
-    }
-    req = urllib.request.Request(
-        api,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": token},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        translated = extract_json(
-            (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
-        )
-        if translated and translated.get("issues"):
-            issues = translated.get("issues") or issues
-    except Exception:
-        pass
-
-for issue in issues:
-    severity = (issue.get("severity") or "").strip().upper()
-    summary = (issue.get("summary") or "").strip()
-    if not severity or not summary:
-        continue
-    print(f"{severity}\t{summary}")
-PY
-}
-
-summarize_review_with_retry() {
-  local repo="$1"
-  local branch="$2"
-  local pr_number="$3"
-  local review_text="$4"
-  local location="$5"
-  local attempts="$SUMMARY_RETRY_COUNT"
-  local delay="$SUMMARY_RETRY_DELAY_SECONDS"
-  local output=""
-  local attempt=1
-
-  if [[ ! "$attempts" =~ ^[0-9]+$ || "$attempts" -le 0 ]]; then
-    attempts=1
-  fi
-  if [[ ! "$delay" =~ ^[0-9]+$ || "$delay" -lt 0 ]]; then
-    delay=0
-  fi
-
-  while (( attempt <= attempts )); do
-    if output="$(summarize_review_with_ai "$repo" "$branch" "$pr_number" "$review_text" "$location")"; then
-      printf '%s' "$output"
-      return 0
-    fi
-    if (( attempt < attempts )); then
-      log "summary 接口调用失败，${delay}s 后重试（${attempt}/${attempts}）：${repo}@${branch}#${pr_number}"
-      sleep "$delay"
-    fi
-    attempt=$((attempt + 1))
-  done
-
-  return 1
-}
-
-normalize_review_text() {
-  local review_text="$1"
-
-  REVIEW_TEXT="$review_text" python3 - <<'PY'
-import os
-import re
-
-text = os.environ.get("REVIEW_TEXT", "")
-if not text.strip():
-    raise SystemExit(0)
-
-text = text.replace("\r\n", "\n")
-text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
-text = re.sub(r"(?mi)^To use Codex here,.*$", "", text)
-text = re.sub(
-    r"To use Codex here, https://chatgpt\\.com/codex/settings/connectors\\.?\\s*",
-    "",
-    text,
-)
-text = re.sub(r"(?mi)^\s*###\s*💡\s*Codex Review\s*$", "", text)
-text = re.sub(r"(?mi)^\s*Here are some automated review suggestions for this pull request\.?\s*$", "", text)
-text = re.sub(r"(?mi)^\s*Useful\? React with.*$", "", text)
-text = re.sub(r"P([0-5])\s*Badge", r"P\1", text, flags=re.IGNORECASE)
-text = re.sub(r"(?mi)^\s*CODEX_LOCATION\b.*$", "", text)
-text = re.sub(r"</?sub>", "", text)
-text = re.sub(r"!\[(P[0-5])\]\([^)]*\)", r"[\1]", text)
-text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
-
-def repl(m):
-    path = m.group("path")
-    lines = m.group("lines").replace("L", "")
-    return f"{path}:{lines}"
-
-text = re.sub(
-    r"https?://github.com/[^\s)]+/blob/[^/]+/(?P<path>[^#\s)]+)#(?P<lines>L\d+(?:-L\d+)?)",
-    repl,
-    text,
-)
-text = re.sub(r"https?://\S+", "", text)
-text = re.sub(r"\n{3,}", "\n\n", text)
-print(text.strip())
-PY
-}
-
-fallback_summary() {
-  local repo="$1"
-  local branch="$2"
-  local pr_number="$3"
-  local review_text="$4"
-  local issues
-  local first_line
-  local severity=""
-  local cleaned=""
-  local normalized=""
-
-  issues="$(printf '%s\n' "$review_text" | grep -E 'P[0-5]' | head -n 5 || true)"
-  if [[ -n "$issues" ]]; then
-    first_line="$(printf '%s\n' "$issues" | head -n 1)"
-    if [[ "$first_line" =~ (P[0-5]) ]]; then
-      severity="${BASH_REMATCH[1]}"
-    else
-      severity="P1"
-    fi
-    cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\*\*//g; s/!\[[^]]*\]\([^)]*\)//g')"
-    printf '%s\t%s\t%s\n' "$severity" "$cleaned" ""
-    return 0
-  fi
-
-  if review_has_no_issues "$review_text"; then
-    printf '%s\t%s\t%s\n' "INFO" "审查未发现风险项" ""
-    return 0
-  fi
-
-  normalized="$(normalize_review_text "$review_text")"
-  if [[ -n "$normalized" ]]; then
-    first_line="${normalized%%$'\n'*}"
-    if [[ -n "$first_line" ]]; then
-      cleaned="$(printf '%s' "$first_line" | strip_urls | sed -E 's/<[^>]+>//g; s/\*\*//g; s/!\[[^]]*\]\([^)]*\)//g')"
-      printf '%s\t%s\t%s\n' "INFO" "$cleaned" ""
-      return 0
-    fi
-  fi
-
-  printf '%s\t%s\t%s\n' "INFO" "审查已完成，未标注 P0-P5" ""
-}
-
-
-build_run_file_from_prs() {
-  local report_date="$1"
-  local gitlab_path branch gh_repo branch_slug head_branch pr_number pr_url
-
-  : > "$RUN_FILE"
-
-  while IFS= read -r raw || [[ -n "$raw" ]]; do
-    local parsed repo_spec
-    parsed="$(parse_repo_line "$raw" || true)"
-    [[ -z "$parsed" ]] && continue
-    IFS=$'\t' read -r repo_spec _ <<< "$parsed"
-
-    gitlab_path="${repo_spec%@*}"
-    branch="${repo_spec#*@}"
-    if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
-      branch="$DEFAULT_BRANCH"
-    fi
-
-    gh_repo="$(github_repo "$gitlab_path")"
-    branch_slug="${branch//\//-}"
-    head_branch="audit/head/$report_date-$branch_slug"
-
-    pr_number="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state all --json number --jq '.[0].number // empty')"
-    if [[ -z "$pr_number" ]]; then
-      continue
-    fi
-
-    pr_url="$(gh pr view --repo "$gh_repo" "$pr_number" --json url --jq '.url')"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$gitlab_path" "$branch" "$gh_repo" "$pr_number" "$pr_url" >> "$RUN_FILE"
-  done < "$REPOS_FILE"
-}
-
-log_missing_prs() {
-  local missing
-
-  missing="$(
-    RUN_FILE="$RUN_FILE" ROOT_DIR="$ROOT_DIR" DEFAULT_BRANCH="$DEFAULT_BRANCH" \
-    python3 - <<'PY'
-import os
-
-run_file = os.environ["RUN_FILE"]
-root_dir = os.environ["ROOT_DIR"]
-default_branch = os.environ.get("DEFAULT_BRANCH", "main")
-
-entries = set()
-if os.path.exists(run_file):
-    with open(run_file, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            entries.add(f"{parts[0]}@{parts[1]}")
-
-config_path = os.path.join(root_dir, "config", "repos.txt")
-if not os.path.exists(config_path):
-    raise SystemExit(0)
-
-missing = []
-with open(config_path, "r", encoding="utf-8") as fh:
-    for raw in fh:
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        repo_spec = line.split(None, 1)[0]
-        if "@" in repo_spec:
-            path, branch = repo_spec.split("@", 1)
-            branch = branch.strip() or default_branch
-        else:
-            path = repo_spec.strip()
-            branch = default_branch
-        key = f"{path}@{branch}"
-        if key not in entries:
-            missing.append(key)
-
-for item in missing:
-    print(item)
-PY
-  )"
-
-  if [[ -n "$missing" ]]; then
-    while IFS= read -r item; do
-      [[ -z "$item" ]] && continue
-      log "未找到 PR，跳过：$item"
-    done <<< "$missing"
-  fi
-}
-
-build_payload() {
-  local title="$1"
-  local content="$2"
-
-  TITLE="$title" REPORT_CONTENT="$content" python3 - <<'PY'
-import json
-import os
-import re
-import sys
-
-title = os.environ["TITLE"]
-content = os.environ.get("REPORT_CONTENT", "").strip() or "暂无审计结果。"
-message_type = os.environ.get("LARK_MESSAGE_TYPE", "card_v2").strip()
-
-def build_post_payload(title, content):
-    lines = content.splitlines()
-    elements = []
-    in_code = False
-    code_buf = []
-    fence = chr(96) * 3
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(fence):
-            if in_code:
-                code_text = "\n".join(code_buf).rstrip("\n")
-                if code_text:
-                    elements.append([{"tag": "code", "text": code_text}])
-                code_buf = []
-                in_code = False
-            else:
-                in_code = True
-            continue
-
-        if in_code:
-            code_buf.append(line)
-            continue
-
-        if not line.strip():
-            elements.append([{"tag": "text", "text": " "}])
-            continue
-
-        elements.append([{"tag": "text", "text": line}])
-
-    if in_code and code_buf:
-        elements.append([{"tag": "code", "text": "\n".join(code_buf).rstrip("\n")}])
-
-    return {
-        "msg_type": "post",
-        "content": {
-            "post": {
-                "zh_cn": {
-                    "title": title,
-                    "content": elements,
-                }
-            }
-        },
-    }
-
-def build_card_v2_payload(title, content):
-    content = content.strip() or "暂无审计结果。"
-    date = ""
-    repo = ""
-    match = re.match(r"^每[日周]代码审查报告（([^）]+)）\s*-\s*(.+)$", title)
-    if match:
-        date = match.group(1).strip()
-        repo = match.group(2).strip()
-
-    parts = content.split("\n<br>\n<br>\n", 1)
-    meta_block = ""
-    findings_block = content.strip()
-    if len(parts) == 2:
-        meta_block = parts[0].strip()
-        findings_block = parts[1].strip()
-
-    if findings_block.startswith("【发现】"):
-        findings_block = findings_block[len("【发现】"):].lstrip()
-
-    issue_count = 0
-    max_severity = None
-    in_code = False
-    for line in findings_block.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_code = not in_code
-            continue
-        if in_code:
-            continue
-        if stripped.startswith("- "):
-            issue_count += 1
-            sev_match = re.search(r"\bP[0-5]\b", stripped)
-            if sev_match:
-                sev = sev_match.group(0)
-                if max_severity is None or int(sev[1]) < int(max_severity[1]):
-                    max_severity = sev
-
-    overview_lines = []
-    if repo:
-        overview_lines.append(f"**仓库**：`{repo}`")
-    if date:
-        overview_lines.append(f"**日期**：{date}")
-    if issue_count:
-        severity_colors = {
-            "P0": "red",
-            "P1": "orange",
-            "P2": "yellow",
-            "P3": "blue",
-            "P4": "green",
-            "P5": "neutral",
-        }
-        color = severity_colors.get(max_severity, "blue")
-        overview_lines.append(f"**风险**：<text_tag color='{color}'>{issue_count} 项</text_tag>")
-    overview_md = "\n".join(overview_lines)
-
-    elements = []
-    if overview_md:
-        elements.append({"tag": "markdown", "content": overview_md, "text_size": "normal"})
-    if meta_block:
-        elements.append({"tag": "markdown", "content": meta_block, "text_size": "notation"})
-    if overview_md or meta_block:
-        elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": "## 发现"})
-    elements.append({"tag": "markdown", "content": findings_block or "暂无审计结果。"})
-
-    return {
-        "msg_type": "interactive",
-        "card": {
-            "schema": "2.0",
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue",
-            },
-            "body": {
-                "elements": elements
-            },
-        },
-    }
-
-if message_type == "post":
-    payload = build_post_payload(title, content)
-elif message_type in ("card", "card_v2", "interactive_v2"):
-    payload = build_card_v2_payload(title, content)
-else:
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue"
-            },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
-            ]
-        }
-    }
-
-print(json.dumps(payload))
-PY
-}
-
-use_rich_tags=0
-case "${LARK_MESSAGE_TYPE:-card_v2}" in
-  card|card_v2|interactive_v2) use_rich_tags=1 ;;
-esac
 
 sent_any=0
 for REPORT_DATE in "${REPORT_DATES[@]}"; do
@@ -1782,22 +455,17 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
   fi
 
   if [[ ! -s "$RUN_FILE" ]]; then
-    build_run_file_from_prs "$REPORT_DATE"
+    log "无运行记录，跳过：$REPORT_DATE"
+    continue
   fi
 
-  log_missing_prs
-
-  if [[ -s "$RUN_FILE" ]]; then
-  while IFS=$'\t' read -r gitlab_path branch gh_repo pr_number pr_url; do
-    ISSUES_FOR_MEEGLE=()
+  while IFS=$'\t' read -r gitlab_path branch gh_repo base_sha head_sha artifact_json artifact_md; do
     [[ -z "$gitlab_path" ]] && continue
-    pr_head_sha="$(gh pr view --repo "$gh_repo" "$pr_number" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo '')"
-    if [[ -n "$pr_head_sha" ]]; then
-      mirror_for_fetch="$(repo_dir "$gh_repo")"
-      if [[ -d "$mirror_for_fetch" ]]; then
-        git -C "$mirror_for_fetch" fetch origin "pull/$pr_number/head:refs/audit/pr/$pr_number" 2>/dev/null || true
-      fi
+    if [[ -z "${artifact_md:-}" ]]; then
+      log "run 文件不是本地 artifact 格式，跳过：${gitlab_path}@${branch}"
+      continue
     fi
+
     if [[ -n "$TARGET_ENTRY" ]]; then
       target_path="${TARGET_ENTRY%@*}"
       target_branch="${TARGET_ENTRY#*@}"
@@ -1809,296 +477,12 @@ for REPORT_DATE in "${REPORT_DATES[@]}"; do
       fi
     fi
 
-    cadence="$(repo_cadence_for "$gitlab_path" "$branch")"
-    report_label="$(cadence_title_label "$cadence")"
-    report_marker="$(cadence_report_label "$cadence")"
-    report_marker_text="已发送${report_marker}"
-
-    if [[ "$cadence" == "daily" && "$TODAY_DOW" -ge 6 && "$REPORT_DATE" == "$TODAY" ]]; then
-      log "周末日报延后到周一发送：$gitlab_path@$branch"
-      continue
-    fi
-
-    if [[ "${LARK_DRY_RUN:-0}" != "1" && "${FORCE_RESEND:-0}" != "1" ]]; then
-      if report_already_sent "$gh_repo" "$pr_number"; then
-        log "${report_marker_text}，跳过：$gitlab_path@$branch"
-        continue
-      fi
-    fi
-
-    review_text="$(get_review_text "$gh_repo" "$pr_number")"
-    if [[ -z "$(printf '%s' "$review_text" | tr -d '[:space:]')" ]]; then
-      log "未获取到 review，跳过发送：$gitlab_path@$branch"
-      continue
-    fi
-
-    if codex_setup_required "$review_text"; then
-      log "检测到 Codex 未授权提示，重新触发审查并延后发送：$gitlab_path@$branch"
-      if schedule_retry "$gitlab_path" "$branch" "$gh_repo" "$pr_number"; then
-        trigger_codex_review "$gh_repo" "$pr_number"
-      fi
-      continue
-    fi
-
-    if codex_usage_limited "$review_text"; then
-      log "识别到流量不足，跳过：$gitlab_path@$branch"
-      continue
-    fi
-
-    if review_has_no_issues "$review_text"; then
-      if ! review_contains_severity "$review_text"; then
-        log "审查无风险项，跳过发送：$gitlab_path@$branch"
-        continue
-      fi
-    fi
-
-    if ! review_contains_severity "$review_text"; then
-      log "审查未标注 P0-P5，继续发送：$gitlab_path@$branch"
-    fi
-
-    location_info="$(extract_location "$review_text")"
-    location=""
-    path=""
-    location_commit=""
-    location_path=""
-    location_start=""
-    location_end=""
-    if [[ -n "$location_info" ]]; then
-      read -r location_commit location_path location_start location_end <<< "$location_info"
-      path="$location_path"
-      location="${location_path}:${location_start}-${location_end}"
-      repo_path="$(repo_dir "$gh_repo")"
-    fi
-
-	    content=""
-	    summary_lines=""
-	    responsible_block=""
-	    responsible_source=""
-	    blame_authors_tsv=""
-	    issue_entries=()
-	    while IFS= read -r -d '' entry; do
-	      issue_entries+=("$entry")
-	    done < <(collect_issue_evidence "$gh_repo" "$pr_number" "$branch")
-	    blame_authors_tsv="$(collect_issue_blame_authors "$gh_repo" "$pr_number" "$branch" || true)"
-	    if [[ "${#issue_entries[@]}" -eq 0 && -n "$location_commit" && -n "$location_path" ]]; then
-	      fallback_snippet="$(get_code_snippet "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
-	      fallback_blame_authors="$(get_blame_authors "$repo_path" "$location_commit" "$location_path" "$location_start" "$location_end" "$branch" || true)"
-	      if [[ -n "$fallback_blame_authors" && -z "$blame_authors_tsv" ]]; then
-	        blame_authors_tsv="$(merge_author_tsv "$fallback_blame_authors" || true)"
-	      fi
-	      if [[ -n "$fallback_snippet" || -n "$fallback_blame_authors" ]]; then
-	        lang="$(code_lang "$location_path")"
-	        entry_location="${location_path}:${location_start}-${location_end}"
-	        snippet_block=""
-	        responsible_line=""
-	        if [[ -n "$fallback_snippet" ]]; then
-	          snippet_block="$(printf '```%s\n%s\n```' "$lang" "$fallback_snippet")"
-	        fi
-	        if [[ -n "$fallback_blame_authors" ]]; then
-	          responsible_line="$(format_mention_line "$fallback_blame_authors" "疑似责任人" || true)"
-	        fi
-	        issue_entries+=("${entry_location}"$'\037'"$snippet_block"$'\037'"$responsible_line")
-	      fi
-	    fi
-	    if [[ -n "$blame_authors_tsv" ]]; then
-	      responsible_block="$(format_mention_line "$blame_authors_tsv" "疑似责任人" || true)"
-	      responsible_source="review 行 blame"
-	    fi
-	    if command -v "${CODEX_EXEC_BIN:-codex}" >/dev/null 2>&1; then
-	      if ! summary_lines="$(summarize_review_with_retry "$gitlab_path" "$branch" "$pr_number" "$review_text" "$location")"; then
-        add_summary_failure "${REPORT_DATE} ${gitlab_path}@${branch}#${pr_number}"
-        summary_lines=""
-      fi
-    fi
-    if [[ -z "$summary_lines" ]]; then
-      summary_lines="$(fallback_summary "$gitlab_path" "$branch" "$pr_number" "$review_text")"
-    fi
-    if [[ -n "$summary_lines" ]]; then
-      snippet_index=0
-      while IFS=$'\t' read -r severity summary file line_start line_end evidence; do
-        [[ -z "$severity" ]] && continue
-        [[ -z "$summary" ]] && continue
-	        entry_location=""
-	        entry_snippet=""
-	        entry_responsible=""
-	        attach_snippet=0
-	        if [[ "$severity" =~ ^[Pp][0-5]$ ]]; then
-	          attach_snippet=1
-	          if [[ "$snippet_index" -lt "${#issue_entries[@]}" ]]; then
-	            entry="${issue_entries[$snippet_index]}"
-	            snippet_index=$((snippet_index + 1))
-	            entry_location="${entry%%$'\037'*}"
-	            if [[ "$entry_location" != "$entry" ]]; then
-	              entry_rest="${entry#*$'\037'}"
-	              entry_snippet="${entry_rest%%$'\037'*}"
-	              if [[ "$entry_rest" != "$entry_snippet" ]]; then
-	                entry_responsible="${entry_rest#*$'\037'}"
-	              fi
-	            else
-	              entry_location=""
-	              entry_snippet=""
-            fi
-          fi
-        fi
-        color="blue"
-        label="$severity"
-        use_bullet=0
-        case "$severity" in
-          P0|p0) color="red"; use_bullet=1 ;;
-          P1|p1) color="orange"; use_bullet=1 ;;
-          P2|p2) color="yellow"; use_bullet=1 ;;
-          P3|p3) color="blue"; use_bullet=1 ;;
-          P4|p4) color="green"; use_bullet=1 ;;
-          P5|p5) color="neutral"; use_bullet=1 ;;
-          INFO|info|NONE|none) color="neutral"; label="提示" ;;
-        esac
-        if (( use_bullet )); then
-          if [[ "$use_rich_tags" -eq 1 ]]; then
-            line="- <text_tag color='$color'>$label</text_tag> $summary"
-          else
-            line="- [$label] $summary"
-          fi
-          line_location=""
-          if [[ -n "$entry_location" ]]; then
-            line_location="$entry_location"
-          elif [[ "${#issue_entries[@]}" -eq 0 ]]; then
-            line_location="$location"
-          fi
-	          if [[ -n "$line_location" ]]; then
-	            line+="（位置: ${line_location}）"
-	          fi
-	          if [[ -n "$entry_responsible" ]]; then
-	            line+="（${entry_responsible}）"
-	          fi
-	        else
-          if [[ "$use_rich_tags" -eq 1 ]]; then
-            line="<text_tag color='$color'>$label</text_tag> $summary"
-          else
-            line="${label}：${summary}"
-          fi
-        fi
-        if [[ -n "$file" && "${line_start:-0}" != "0" ]]; then
-          pr_url_safe="${pr_url:-https://github.com/${GITHUB_ORG}/$(basename "$gitlab_path")/pull/${pr_number}}"
-          issue_json=$(S_SEV="$severity" S_SUMMARY="$summary" S_FILE="$file" \
-            S_LS="$line_start" S_LE="$line_end" S_EV="$evidence" \
-            S_ORIG="$review_text" S_REPO="$(basename "$gitlab_path")" \
-            S_PR="$pr_number" S_PRURL="$pr_url_safe" \
-            S_SHA="${pr_head_sha:-}" \
-            python3 -c '
-import json, os
-print(json.dumps({
-  "severity": os.environ["S_SEV"],
-  "summary":  os.environ["S_SUMMARY"],
-  "file":     os.environ["S_FILE"],
-  "line_start": int(os.environ["S_LS"]),
-  "line_end":   int(os.environ["S_LE"]),
-  "evidence": os.environ["S_EV"],
-  "original": os.environ["S_ORIG"],
-  "repo":     os.environ["S_REPO"],
-  "pr":       os.environ["S_PR"],
-  "pr_url":   os.environ["S_PRURL"],
-  "head_sha": os.environ["S_SHA"],
-}, ensure_ascii=False))
-')
-          ISSUES_FOR_MEEGLE+=("$issue_json")
-        fi
-        content+="$line"$'\n'
-        if (( attach_snippet )) && [[ -n "$entry_snippet" ]]; then
-          content+="$entry_snippet"$'\n'
-        fi
-      done <<< "$summary_lines"
-    fi
-
-    if [[ -z "$(printf '%s' "$content" | tr -d '[:space:]')" ]]; then
-      log "审查摘要为空，跳过发送：$gitlab_path@$branch"
-      continue
-    fi
-
-	    if [[ -z "$responsible_block" ]]; then
-	      daily_authors_tsv="$(fetch_pr_authors_tsv "$gh_repo" "$pr_number" || true)"
-	      if [[ -n "$daily_authors_tsv" ]]; then
-	        responsible_block="$(format_mention_line "$daily_authors_tsv" "疑似责任人(按提交人兜底)" || true)"
-	        responsible_source="PR 提交人兜底"
-	      fi
-	    fi
-
-	    final_content=""
-	    if [[ -n "$responsible_block" ]]; then
-	      final_content+="$responsible_block"
-	      if [[ -n "$responsible_source" ]]; then
-	        final_content+="（依据: ${responsible_source}）"
-	      fi
-	    fi
-    if [[ -n "$final_content" ]]; then
-      final_content+=$'\n<br>\n<br>\n'
-    fi
-    final_content+="【发现】"$'\n\n'
-    final_content+="$content"
-    if [[ -n "${REVIEW_DASHBOARD_URL:-}" ]]; then
-      final_content+=$'\n<br>\n<br>\n'
-      final_content+="Review 状态页：${REVIEW_DASHBOARD_URL}"
-    fi
-
-    title="${report_label}代码审查报告（${REPORT_DATE}） - ${gitlab_path}@${branch}"
-    payload="$(build_payload "$title" "$final_content")"
-
-    repo_slug="${gitlab_path//\//_}-${branch//\//-}"
-    REPORT_TEXT_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.txt"
-    REPORT_PAYLOAD_FILE="$RUN_DIR/report-$REPORT_DATE-$repo_slug.json"
-    printf '%s' "$final_content" > "$REPORT_TEXT_FILE"
-    printf '%s' "$payload" > "$REPORT_PAYLOAD_FILE"
-
-    if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
-      log "DRY_RUN=1，已生成报告：$REPORT_TEXT_FILE"
-      log "DRY_RUN=1，已生成 payload：$REPORT_PAYLOAD_FILE"
-      cat "$REPORT_TEXT_FILE"
-    fi
-
-    webhook_url="$(resolve_lark_webhook)"
-    if [[ "${LARK_DRY_RUN:-0}" == "1" ]]; then
-      log "DRY_RUN=1，使用测试 webhook 发送"
-    fi
-
-    response="$(curl -s -X POST -H 'Content-Type: application/json' -d "$payload" -w $'\n%{http_code}' "$webhook_url")"
-    http_code="${response##*$'\n'}"
-    body="${response%$'\n'*}"
-
-    if [[ "$http_code" != "200" ]]; then
-      log "Lark 发送失败（HTTP ${http_code}），跳过标记：${gitlab_path}@${branch}"
-      if [[ -n "$body" ]]; then
-        log "Lark 响应: $body"
-      fi
-      continue
-    fi
-
-    if ! check_lark_response "$body"; then
-      log "Lark 返回错误，跳过标记：$gitlab_path@$branch"
-      if [[ -n "$body" ]]; then
-        log "Lark 响应: $body"
-      fi
-      continue
-    fi
-
-    if [[ "${LARK_DRY_RUN:-0}" != "1" ]]; then
-      post_report_comment "$gh_repo" "$pr_number" "$final_content" "$report_marker_text"
-      log "已发送${report_marker}：$gitlab_path@$branch"
-    else
-      log "DRY_RUN=1，已发送测试${report_marker}：$gitlab_path@$branch"
-    fi
-    mirror_dir="$(repo_dir "$(github_repo "$gitlab_path")")"
-    create_meegle_bugs "$mirror_dir" || log "meegle batch 含错误，看 ${STATE_DIR}/meegle-created.log"
-    sent_any=1
+    process_local_artifact_entry "$REPORT_DATE" "$gitlab_path" "$branch" "$gh_repo" "$base_sha" "$head_sha" "$artifact_json" "$artifact_md"
   done < "$RUN_FILE"
-fi
 done
 
 if [[ "$sent_any" -eq 0 ]]; then
   log "无审查结果，跳过发送"
-fi
-
-send_summary_alert_dry || true
-
-if [[ "$sent_any" -eq 0 ]]; then
   exit 0
 fi
 
