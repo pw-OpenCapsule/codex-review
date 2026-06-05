@@ -9,6 +9,6 @@ echo "$out" | python3 -c '
 import json,sys
 d = json.loads(sys.stdin.read())
 assert "author_email" in d, "no author_email key"
-assert "meegle_user_key" in d
+assert "lark_open_id" in d
 print("OK")
 '

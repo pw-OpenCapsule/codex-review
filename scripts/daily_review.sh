@@ -60,8 +60,6 @@ YESTERDAY_LOG_LIMIT="${YESTERDAY_LOG_LIMIT:-20}"
 : > "$RUN_FILE_TMP"
 : > "$QUEUE_FILE"
 
-ensure_gh_auth
-
 if (( DRY_RUN )); then
   log "DRY RUN: 仅模拟执行，不创建 PR/评论"
 fi
@@ -298,47 +296,12 @@ compute_score() {
 tracking_ref_for_branch() {
   local branch="$1"
 
-  if [[ "${SYNC_FROM_GITLAB:-0}" == "1" && "${DRY_RUN:-0}" == "1" ]]; then
+  if [[ "${SYNC_FROM_GITLAB:-0}" == "1" ]]; then
     printf '%s/%s' "$(gitlab_remote_name)" "$branch"
     return 0
   fi
 
   printf 'origin/%s' "$branch"
-}
-
-github_repo_exists() {
-  local gh_repo="$1"
-  gh repo view "$gh_repo" --json name >/dev/null 2>&1
-}
-
-github_repo_visibility_flag() {
-  local visibility="${GITHUB_REPO_VISIBILITY:-private}"
-
-  case "$visibility" in
-    private|public|internal)
-      printf '%s' "--$visibility"
-      ;;
-    "")
-      printf ''
-      ;;
-    *)
-      die "GITHUB_REPO_VISIBILITY 无效：$visibility"
-      ;;
-  esac
-}
-
-create_github_repo() {
-  local gh_repo="$1"
-  local visibility_flag
-
-  visibility_flag="$(github_repo_visibility_flag)"
-  log "创建 GitHub 仓库：$gh_repo"
-
-  if ! gh repo create "$gh_repo" "$visibility_flag" >/dev/null; then
-    return 1
-  fi
-
-  return 0
 }
 
 prepare_repo() {
@@ -347,6 +310,7 @@ prepare_repo() {
   dir="$(repo_dir "$gh_repo")"
 
   if [[ ! -d "$dir/.git" ]]; then
+    ensure_gh_auth
     log "正在克隆 $gh_repo"
     git clone "https://github.com/$gh_repo.git" "$dir"
   fi
@@ -500,15 +464,7 @@ sync_from_gitlab() {
     return 0
   fi
 
-  if ! git -C "$dir" push -f origin "$remote/$branch:refs/heads/$branch"; then
-    log "推送到 GitHub 失败：$gitlab_path@$branch"
-    return 1
-  fi
-
-  if ! git -C "$dir" fetch origin "$branch" >/dev/null 2>&1; then
-    log "更新 GitHub 远端分支失败：$gitlab_path@$branch"
-    return 1
-  fi
+  return 0
 }
 
 collect_queue() {
@@ -558,14 +514,6 @@ collect_queue() {
     fi
 
     gh_repo="$(github_repo "$gitlab_path")"
-    if ! github_repo_exists "$gh_repo"; then
-      log "GitHub 仓库不存在，自动创建：$gh_repo"
-      if ! create_github_repo "$gh_repo"; then
-        log "GitHub 仓库创建失败，跳过：$gh_repo"
-        continue
-      fi
-      repo_created=1
-    fi
     dir="$(prepare_repo "$gh_repo")"
 
     if ! sync_from_gitlab "$dir" "$gitlab_path" "$branch"; then
@@ -649,162 +597,50 @@ collect_queue() {
 done < "$REPOS_FILE"
 }
 
-create_or_find_pr() {
-  local gh_repo="$1"
-  local dir="$2"
-  local base_sha="$3"
-  local head_sha="$4"
-  local branch="$5"
-  local review_label="${6:-每周}"
-  local branch_slug="${branch//\//-}"
-  local base_branch="audit/base/$TODAY-$branch_slug"
-  local head_branch="audit/head/$TODAY-$branch_slug"
-  local pr_number=""
-
-  pr_number="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state open --json number --jq '.[0].number // empty')"
-  if [[ -n "$pr_number" ]]; then
-    printf '%s' "$pr_number"
-    return 0
-  fi
-
-  local existing_any
-  existing_any="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state all --json number --jq '.[0].number // empty')"
-  if [[ -n "$existing_any" ]]; then
-    printf '%s' "$existing_any"
-    return 0
-  fi
-
-  git -C "$dir" branch -f "$base_branch" "$base_sha"
-  git -C "$dir" branch -f "$head_branch" "$head_sha"
-  git -C "$dir" push -f origin "$base_branch" "$head_branch"
-
-  gh pr create \
-    --repo "$gh_repo" \
-    --base "$base_branch" \
-    --head "$head_branch" \
-    --title "【${review_label}审计】$TODAY ($branch)" \
-    --body "${review_label}审计差异：${base_sha} -> ${head_sha}，分支：${branch}。" \
-    >/dev/null
-
-  pr_number="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state open --json number --jq '.[0].number // empty')"
-  printf '%s' "$pr_number"
+artifact_slug() {
+  local gitlab_path="$1"
+  local branch="$2"
+  printf '%s-%s' "${gitlab_path//\//_}" "${branch//\//-}"
 }
 
-ensure_codex_comment() {
-  local gh_repo="$1"
-  local pr_number="$2"
+run_local_codex_review() {
+  local gitlab_path="$1"
+  local branch="$2"
+  local gh_repo="$3"
+  local dir="$4"
+  local base_sha="$5"
+  local head_sha="$6"
+  local cadence="$7"
+  local slug artifact_dir artifact_json artifact_md
+
+  slug="$(artifact_slug "$gitlab_path" "$branch")"
+  artifact_dir="$RUN_DIR/reviews/$TODAY"
+  artifact_json="$artifact_dir/$slug.json"
+  artifact_md="$artifact_dir/$slug.md"
 
   if (( DRY_RUN )); then
-    log "DRY RUN: 跳过评论 $gh_repo#$pr_number"
+    log "DRY RUN: 将用 Codex SDK 本地审查 $gitlab_path@$branch ($base_sha -> $head_sha)"
     return 0
   fi
 
-  if [[ "${FORCE_COMMENT:-0}" == "1" ]]; then
-    gh pr comment --repo "$gh_repo" "$pr_number" --body "$CODEX_PROMPT (re-run $(date +'%F %T'))" >/dev/null
-    return 0
+  if ! python3 "$SCRIPT_DIR/lib/local_codex_review.py" \
+      --repo "$gitlab_path" \
+      --branch "$branch" \
+      --base-sha "$base_sha" \
+      --head-sha "$head_sha" \
+      --workdir "$dir" \
+      --output-json "$artifact_json" \
+      --output-markdown "$artifact_md" >/dev/null; then
+    log "Codex SDK 审查失败：$gitlab_path@$branch"
+    return 1
   fi
 
-  local already
-  already="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments --jq '[.comments[].body | contains("@codex review")] | any')"
-  if [[ "$already" == "true" ]]; then
-    return 0
-  fi
-
-  gh pr comment --repo "$gh_repo" "$pr_number" --body "$CODEX_PROMPT" >/dev/null
-}
-
-pr_review_ready() {
-  local gh_repo="$1"
-  local pr_number="$2"
-  local pr_json
-
-  pr_json="$(gh pr view --repo "$gh_repo" "$pr_number" --json comments,reviews)"
-
-  CODEX_REVIEW_AUTHOR="${CODEX_REVIEW_AUTHOR:-}" CODEX_PROMPT="${CODEX_PROMPT:-}" PR_JSON="$pr_json" \
-  python3 - <<'PY'
-import json
-import os
-import sys
-
-raw = os.environ.get("PR_JSON", "")
-if not raw.strip():
-    sys.exit(1)
-
-data = json.loads(raw)
-author = os.environ.get("CODEX_REVIEW_AUTHOR") or ""
-prompt = os.environ.get("CODEX_PROMPT") or ""
-
-comments = data.get("comments") or []
-reviews = data.get("reviews") or []
-
-def body_text(item):
-    return item.get("body") if isinstance(item, dict) else None
-
-ready = False
-if author:
-    for item in comments:
-        if (item.get("author") or {}).get("login") == author:
-            ready = True
-            break
-    if not ready:
-        for item in reviews:
-            if (item.get("author") or {}).get("login") == author:
-                ready = True
-                break
-else:
-    for item in comments:
-        text = body_text(item) or ""
-        if not text:
-            continue
-        if prompt and text.startswith(prompt):
-            continue
-        ready = True
-        break
-    if not ready:
-        for item in reviews:
-            text = body_text(item) or ""
-            if text:
-                ready = True
-                break
-
-sys.exit(0 if ready else 1)
-PY
-}
-
-wait_for_reviews() {
-  local run_file="$1"
-  local timeout="${REVIEW_WAIT_SECONDS:-0}"
-  local interval="${REVIEW_POLL_INTERVAL:-60}"
-  local start_ts
-  local pending
-
-  if (( timeout <= 0 )); then
-    return 0
-  fi
-
-  start_ts="$(date +%s)"
-
-  while :; do
-    pending=0
-    while IFS=$'\t' read -r gitlab_path branch gh_repo pr_number pr_url; do
-      [[ -z "$gitlab_path" ]] && continue
-      if ! pr_review_ready "$gh_repo" "$pr_number" >/dev/null 2>&1; then
-        pending=1
-        break
-      fi
-    done < "$run_file"
-
-    if (( pending == 0 )); then
-      return 0
-    fi
-
-    if (( $(date +%s) - start_ts >= timeout )); then
-      log "等待审查超时，仍发送报告"
-      return 1
-    fi
-
-    sleep "$interval"
-  done
+  log "Codex SDK 审查完成：$artifact_json"
+  printf '%s\n' "$head_sha" > "$(state_file "$gitlab_path" "$branch")"
+  mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$gitlab_path" "$branch" "$gh_repo" "$base_sha" "$head_sha" "$artifact_json" "$artifact_md" \
+    >> "$RUN_FILE_TMP"
 }
 
 auto_send_report() {
@@ -832,14 +668,13 @@ auto_send_report() {
     return 0
   fi
 
-  wait_for_reviews "$RUN_FILE" || true
   "$SCRIPT_DIR/send_lark_report.sh"
   touch "$RUN_SENT_FILE"
 }
 
 process_queue() {
   local count=0
-  local score gitlab_path branch base_sha head_sha cadence gh_repo dir pr_number pr_url
+  local score gitlab_path branch base_sha head_sha cadence gh_repo dir
 
   if [[ ! -s "$QUEUE_FILE" ]]; then
     log "无待处理变更"
@@ -856,50 +691,16 @@ process_queue() {
 
     gh_repo="$(github_repo "$gitlab_path")"
     dir="$(repo_dir "$gh_repo")"
-    local review_label
-    review_label="$(cadence_title_label "$cadence")"
-
     if (( DRY_RUN )); then
-      local branch_slug head_branch pr_existing
-      branch_slug="${branch//\//-}"
-      head_branch="audit/head/$TODAY-$branch_slug"
-      pr_existing="$(gh pr list --repo "$gh_repo" --head "$head_branch" --state all --json number --jq '.[0].number // empty')"
-      if [[ -n "$pr_existing" ]]; then
-        pr_url="$(gh pr view --repo "$gh_repo" "$pr_existing" --json url --jq '.url')"
-        log "DRY RUN: 复用 PR $pr_url"
-      else
-      log "DRY RUN: 将创建 PR $gh_repo $branch ($base_sha -> $head_sha)"
-      fi
-      log "DRY RUN: 将评论 @codex ($gitlab_path@$branch)"
+      log "DRY RUN: 将本地 SDK 审查 $gitlab_path@$branch ($base_sha -> $head_sha)"
       count=$((count + 1))
       continue
     fi
 
-    pr_number="$(create_or_find_pr "$gh_repo" "$dir" "$base_sha" "$head_sha" "$branch" "$review_label")"
-    if [[ -z "$pr_number" ]]; then
-      log "创建拉取请求失败：$gitlab_path@$branch"
-      continue
+    if run_local_codex_review "$gitlab_path" "$branch" "$gh_repo" "$dir" "$base_sha" "$head_sha" "$cadence"; then
+      count=$((count + 1))
+      sleep "$SLEEP_BETWEEN_SECONDS"
     fi
-
-    local pr_state
-    pr_state="$(gh pr view --repo "$gh_repo" "$pr_number" --json state --jq '.state')"
-    if [[ "$pr_state" != "OPEN" ]]; then
-      log "拉取请求 $pr_number 状态为 $pr_state，跳过评论"
-      printf '%s\n' "$head_sha" > "$(state_file "$gitlab_path" "$branch")"
-      mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
-      continue
-    fi
-
-    ensure_codex_comment "$gh_repo" "$pr_number"
-    pr_url="$(gh pr view --repo "$gh_repo" "$pr_number" --json url --jq '.url')"
-    log "PR 已创建/复用：$pr_url"
-
-    printf '%s\n' "$head_sha" > "$(state_file "$gitlab_path" "$branch")"
-    mark_cadence_checked "$gitlab_path" "$branch" "$cadence"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$gitlab_path" "$branch" "$gh_repo" "$pr_number" "$pr_url" >> "$RUN_FILE_TMP"
-
-    count=$((count + 1))
-    sleep "$SLEEP_BETWEEN_SECONDS"
   done < "$QUEUE_FILE.sorted"
 }
 
