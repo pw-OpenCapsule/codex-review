@@ -48,7 +48,9 @@ load_settings() {
   set +a
 
   # Let deployment-local .env override settings.env when both exist.
-  load_dotenv "$root"
+  if [[ "${CODEX_REVIEW_LOAD_DOTENV:-1}" != "0" ]]; then
+    load_dotenv "$root"
+  fi
 
   REPOS_FILE="${REPOS_FILE:-$root/config/repos.txt}"
   LARK_USER_MAP="${LARK_USER_MAP:-$root/config/lark_user_map.tsv}"
@@ -238,6 +240,52 @@ gitlab_repo_url() {
   fi
 }
 
-if [[ -n "${ROOT_DIR:-}" ]]; then
-  load_dotenv "$ROOT_DIR"
-fi
+select_remote_branch() {
+  local dir="$1"
+  local remote="$2"
+  local requested="$3"
+  local branches
+  local candidate branch
+
+  branches="$(git -C "$dir" for-each-ref --format='%(refname:short)' "refs/remotes/$remote" \
+    | sed "s#^${remote}/##" \
+    | grep -v '^HEAD$' || true)"
+  [[ -z "$branches" ]] && return 1
+
+  for candidate in "$requested" dev develop main master; do
+    while IFS= read -r branch; do
+      [[ "$branch" == "$candidate" ]] && {
+        printf '%s' "$branch"
+        return 0
+      }
+    done <<< "$branches"
+  done
+
+  printf '%s' "$branches" | head -n 1
+}
+
+fetch_gitlab_branch_with_fallback() {
+  local dir="$1"
+  local remote="$2"
+  local branch="$3"
+  local resolved
+
+  if git -C "$dir" -c credential.helper= fetch "$remote" "$branch"; then
+    printf '%s' "$branch"
+    return 0
+  fi
+
+  log "分支 ${branch} 拉取失败，尝试拉取 ${remote} 全部分支"
+  if ! git -C "$dir" -c credential.helper= fetch "$remote" '+refs/heads/*:refs/remotes/'"$remote"'/*'; then
+    return 1
+  fi
+
+  if ! resolved="$(select_remote_branch "$dir" "$remote" "$branch")"; then
+    return 1
+  fi
+
+  if [[ "$resolved" != "$branch" ]]; then
+    log "改用存在的分支：${resolved}（原分支：${branch}）"
+  fi
+  printf '%s' "$resolved"
+}

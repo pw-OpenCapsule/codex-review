@@ -83,6 +83,7 @@ printf 'group/demo\tmain\texample-code-review/demo\t1111111111111111111111111111
 
 export PATH="$MOCK_DIR:$PATH"
 export CODEX_REVIEW_SETTINGS="$SETTINGS"
+export CODEX_REVIEW_LOAD_DOTENV=0
 export CURL_CALL_LOG="$TMP_DIR/curl.log"
 export LARK_DRY_RUN=1
 
