@@ -441,8 +441,10 @@ sync_from_gitlab() {
   local branch="$3"
   local remote
   local url
+  local resolved_branch
 
   if [[ "${SYNC_FROM_GITLAB:-0}" != "1" ]]; then
+    SYNC_RESOLVED_BRANCH="$branch"
     return 0
   fi
 
@@ -455,10 +457,12 @@ sync_from_gitlab() {
     git -C "$dir" remote add "$remote" "$url"
   fi
 
-  if ! git -C "$dir" -c credential.helper= fetch "$remote" "$branch"; then
+  if ! resolved_branch="$(fetch_gitlab_branch_with_fallback "$dir" "$remote" "$branch")"; then
     log "拉取 GitLab 失败：$gitlab_path@$branch"
     return 1
   fi
+  branch="$resolved_branch"
+  SYNC_RESOLVED_BRANCH="$branch"
 
   if (( DRY_RUN )); then
     return 0
@@ -516,9 +520,11 @@ collect_queue() {
     gh_repo="$(github_repo "$gitlab_path")"
     dir="$(prepare_repo "$gh_repo")"
 
+    SYNC_RESOLVED_BRANCH="$branch"
     if ! sync_from_gitlab "$dir" "$gitlab_path" "$branch"; then
       continue
     fi
+    branch="$SYNC_RESOLVED_BRANCH"
 
     tracking_ref="$(tracking_ref_for_branch "$branch")"
     if ! head_sha="$(git -C "$dir" rev-parse "$tracking_ref" 2>/dev/null)"; then

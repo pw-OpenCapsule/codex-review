@@ -68,8 +68,10 @@ sync_from_gitlab() {
   local branch="$3"
   local remote
   local url
+  local resolved_branch
 
   if [[ "${SYNC_FROM_GITLAB:-0}" != "1" ]]; then
+    SYNC_RESOLVED_BRANCH="$branch"
     return 0
   fi
 
@@ -82,10 +84,12 @@ sync_from_gitlab() {
     git -C "$dir" remote add "$remote" "$url"
   fi
 
-  if ! git -C "$dir" -c credential.helper= fetch "$remote" "$branch"; then
+  if ! resolved_branch="$(fetch_gitlab_branch_with_fallback "$dir" "$remote" "$branch")"; then
     log "拉取 GitLab 失败：$gitlab_path@$branch"
     return 1
   fi
+  branch="$resolved_branch"
+  SYNC_RESOLVED_BRANCH="$branch"
 
   if ! git -C "$dir" push -f origin "$remote/$branch:refs/heads/$branch"; then
     log "推送到 GitHub 失败：$gitlab_path@$branch"
@@ -139,10 +143,12 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   fi
 
   dir="$(prepare_repo "$gh_repo")"
+  SYNC_RESOLVED_BRANCH="$branch"
   if ! sync_from_gitlab "$dir" "$gitlab_path" "$branch"; then
     failed=$((failed + 1))
     continue
   fi
+  branch="$SYNC_RESOLVED_BRANCH"
 
   if ! git -C "$dir" rev-parse "origin/$branch" >/dev/null 2>&1; then
     log "分支不存在，跳过：$gitlab_path@$branch"

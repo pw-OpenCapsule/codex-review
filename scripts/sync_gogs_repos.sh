@@ -54,8 +54,8 @@ if [[ "$mode" != "all" && "$mode" != "user" && "$mode" != "org" ]]; then
   die "mode 仅支持 all/user/org"
 fi
 
-if [[ "$strategy" != "default" && "$strategy" != "latest" ]]; then
-  die "strategy 仅支持 default/latest"
+if [[ "$strategy" != "default" && "$strategy" != "validate" && "$strategy" != "latest" ]]; then
+  die "strategy 仅支持 default/validate/latest"
 fi
 
 orgs_csv=""
@@ -63,9 +63,26 @@ if [[ "${#orgs[@]}" -gt 0 ]]; then
   orgs_csv="$(IFS=,; printf '%s' "${orgs[*]}")"
 fi
 
+existing_owners_csv=""
+if [[ "${GOGS_INCLUDE_REPOS_FILE_OWNERS:-1}" == "1" && -f "$REPOS_FILE" ]]; then
+  existing_owners_csv="$(
+    awk '
+      /^[[:space:]]*($|#)/ { next }
+      {
+        line = $0
+        sub(/[[:space:]]+#.*/, "", line)
+        split(line, parts, /[[:space:]]+/)
+        split(parts[1], repo, "/")
+        if (repo[1] != "") print repo[1]
+      }
+    ' "$REPOS_FILE" | sort -u | paste -sd, -
+  )"
+fi
+
 repo_lines="$(
   GOGS_BASE_URL="$GOGS_BASE_URL" GOGS_TOKEN="$GOGS_TOKEN" GOGS_MODE="$mode" \
-  GOGS_STRATEGY="$strategy" GOGS_ORGS="$orgs_csv" DEFAULT_BRANCH="$DEFAULT_BRANCH" \
+  GOGS_STRATEGY="$strategy" GOGS_ORGS="$orgs_csv" GOGS_EXISTING_OWNERS="$existing_owners_csv" \
+  GOGS_EXTRA_OWNERS="${GOGS_EXTRA_OWNERS:-}" DEFAULT_BRANCH="$DEFAULT_BRANCH" \
   python3 - <<'PY'
 import json
 import os
@@ -79,10 +96,13 @@ token = os.environ["GOGS_TOKEN"]
 mode = os.environ.get("GOGS_MODE", "all")
 strategy = os.environ.get("GOGS_STRATEGY", "default")
 orgs_csv = os.environ.get("GOGS_ORGS", "")
+existing_owners_csv = os.environ.get("GOGS_EXISTING_OWNERS", "")
+extra_owners_csv = os.environ.get("GOGS_EXTRA_OWNERS", "")
 default_branch = os.environ.get("DEFAULT_BRANCH", "main")
 
 def api_get(url: str):
     req = urllib.request.Request(url)
+    req.add_header("User-Agent", "codex-review-sync/1.0")
     if token:
         req.add_header("Authorization", f"token {token}")
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -114,6 +134,22 @@ def list_org_repos(org: str):
 
 def list_branches(owner: str, repo: str):
     return paged(f"{base}/api/v1/repos/{owner}/{repo}/branches")
+
+def branch_name(branch: dict):
+    return branch.get("name") if isinstance(branch, dict) else None
+
+def validate_branch(owner: str, repo: str, branch: str):
+    try:
+        branches = list_branches(owner, repo)
+    except Exception:
+        return branch
+    names = [name for name in (branch_name(b) for b in branches) if name]
+    if not names or branch in names:
+        return branch
+    for preferred in ("dev", "develop", "main", "master"):
+        if preferred in names:
+            return preferred
+    return names[0]
 
 def parse_date(value: str):
     if not value:
@@ -178,11 +214,18 @@ elif mode == "org":
         repos.extend(list_org_repos(org.strip()))
 else:
     repos = list_user_repos()
+    owner_names = set()
     for org in list_orgs():
         username = org.get("username") or org.get("name")
         if not username:
             continue
-        repos.extend(list_org_repos(username))
+        owner_names.add(username)
+    for raw in (orgs_csv + "," + existing_owners_csv + "," + extra_owners_csv).split(","):
+        owner = raw.strip()
+        if owner:
+            owner_names.add(owner)
+    for owner in sorted(owner_names):
+        repos.extend(list_org_repos(owner))
 
 seen = set()
 lines = []
@@ -197,7 +240,9 @@ for repo in repos:
     seen.add(key)
 
     branch = repo.get("default_branch") or default_branch
-    if strategy == "latest":
+    if strategy == "validate":
+        branch = validate_branch(owner, name, branch)
+    elif strategy == "latest":
         try:
             branches = list_branches(owner, name)
         except Exception:

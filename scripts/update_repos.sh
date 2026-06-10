@@ -4,10 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# shellcheck source=../config/settings.env
-source "$ROOT_DIR/config/settings.env"
 # shellcheck source=./lib.sh
 source "$SCRIPT_DIR/lib.sh"
+load_settings "$ROOT_DIR"
+
+ensure_dirs
 
 log "更新本地镜像（仅 fetch，不 push）"
 
@@ -42,8 +43,8 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
       git -C "$dir" remote add "$remote" "$url"
     fi
 
-    if ! git -C "$dir" -c credential.helper= fetch "$remote" "$branch"; then
+    if ! branch="$(fetch_gitlab_branch_with_fallback "$dir" "$remote" "$branch")"; then
       log "拉取 GitLab 失败：$gitlab_path@$branch"
     fi
   fi
-done < "$ROOT_DIR/config/repos.txt"
+done < "$REPOS_FILE"

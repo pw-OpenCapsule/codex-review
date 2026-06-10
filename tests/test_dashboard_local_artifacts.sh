@@ -9,7 +9,8 @@ WORK_DIR="$TMP_DIR/work"
 STATE_DIR="$TMP_DIR/state"
 SETTINGS="$TMP_DIR/settings.env"
 REPOS="$TMP_DIR/repos.txt"
-ARTIFACT="$RUN_DIR/reviews/2026-06-05/group_demo-main.json"
+TODAY="$(date +%F)"
+ARTIFACT="$RUN_DIR/reviews/$TODAY/group_demo-main.json"
 OUT_HTML="$RUN_DIR/dashboard.html"
 OUT_JSON="$RUN_DIR/dashboard.json"
 
@@ -50,7 +51,7 @@ cat > "$ARTIFACT" <<'JSON'
     "head_sha": "2222222222222222222222222222222222222222",
     "review_backend": "codex_sdk",
     "model": "gpt-5.3-codex",
-    "review_date": "2026-06-05",
+    "review_date": "__TODAY__",
     "artifact_json": "/tmp/review.json"
   },
   "issues": [
@@ -67,12 +68,21 @@ cat > "$ARTIFACT" <<'JSON'
   "rejected": []
 }
 JSON
+python3 - "$ARTIFACT" "$TODAY" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+today = sys.argv[2]
+path.write_text(path.read_text(encoding="utf-8").replace("__TODAY__", today), encoding="utf-8")
+PY
 
 printf 'group/demo\tmain\texample-code-review/demo\t1111111111111111111111111111111111111111\t2222222222222222222222222222222222222222\t%s\t%s\n' \
-  "$ARTIFACT" "${ARTIFACT%.json}.md" > "$RUN_DIR/run-2026-06-05.tsv"
+  "$ARTIFACT" "${ARTIFACT%.json}.md" > "$RUN_DIR/run-$TODAY.tsv"
 
 export PATH="$MOCK_DIR:$PATH"
 export CODEX_REVIEW_SETTINGS="$SETTINGS"
+export CODEX_REVIEW_LOAD_DOTENV=0
 
 bash "$ROOT/scripts/build_review_dashboard.sh" --days 1 --output "$OUT_HTML" --json "$OUT_JSON"
 
