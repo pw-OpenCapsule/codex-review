@@ -10,6 +10,11 @@ export GIT_TERMINAL_PROMPT=0
 source "$SCRIPT_DIR/lib.sh"
 load_settings "$ROOT_DIR"
 
+if [[ -z "${CODEX_REVIEW_PYTHON:-}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  CODEX_REVIEW_PYTHON="$ROOT_DIR/.venv/bin/python"
+fi
+CODEX_REVIEW_PYTHON="${CODEX_REVIEW_PYTHON:-python3}"
+
 usage() {
   cat <<'EOF'
 Usage: daily_review.sh [--dry|--dry-run|-n]
@@ -629,7 +634,7 @@ run_local_codex_review() {
     return 0
   fi
 
-  if ! python3 "$SCRIPT_DIR/lib/local_codex_review.py" \
+  if ! "$CODEX_REVIEW_PYTHON" "$SCRIPT_DIR/lib/local_codex_review.py" \
       --repo "$gitlab_path" \
       --branch "$branch" \
       --base-sha "$base_sha" \

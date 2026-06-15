@@ -270,13 +270,13 @@ fetch_gitlab_branch_with_fallback() {
   local branch="$3"
   local resolved
 
-  if git -C "$dir" -c credential.helper= fetch "$remote" "$branch"; then
+  if gitlab_fetch "$dir" "$remote" "$branch"; then
     printf '%s' "$branch"
     return 0
   fi
 
   log "分支 ${branch} 拉取失败，尝试拉取 ${remote} 全部分支"
-  if ! git -C "$dir" -c credential.helper= fetch "$remote" '+refs/heads/*:refs/remotes/'"$remote"'/*'; then
+  if ! gitlab_fetch "$dir" "$remote" '+refs/heads/*:refs/remotes/'"$remote"'/*'; then
     return 1
   fi
 
@@ -288,4 +288,24 @@ fetch_gitlab_branch_with_fallback() {
     log "改用存在的分支：${resolved}（原分支：${branch}）"
   fi
   printf '%s' "$resolved"
+}
+
+gitlab_fetch() {
+  local dir="$1"
+  local remote="$2"
+  local refspec="$3"
+
+  if [[ "${GITLAB_USE_WARP:-0}" == "1" ]]; then
+    local warp_bin="${GIT_WARP_BIN:-git-warp}"
+    if ! command -v "$warp_bin" >/dev/null 2>&1; then
+      log "GITLAB_USE_WARP=1 但找不到 git-warp：$warp_bin"
+      return 1
+    fi
+    GIT_WARP_PORT="${GIT_WARP_PORT:-443}" \
+      GIT_WARP_WAIT="${GIT_WARP_WAIT:-60}" \
+      "$warp_bin" -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
+    return
+  fi
+
+  git -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
 }
