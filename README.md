@@ -99,7 +99,7 @@ Codex SDK 本地审查
   - `$RUN_DIR/reviews/<date>/<repo>-<branch>.json`
   - `$RUN_DIR/reviews/<date>/<repo>-<branch>.md`
 - 配置项：
-  - `CODEX_SDK_MODEL`（默认 `gpt-5.3-codex`）
+  - `CODEX_SDK_MODEL`（留空时使用 Codex SDK / 当前账号默认模型）
   - `CODEX_SDK_SANDBOX`（默认 `read_only`）
   - `CODEX_SDK_TIMEOUT`（默认 300）
   - `CODEX_SDK_MAX_DIFF_CHARS`（默认 120000）

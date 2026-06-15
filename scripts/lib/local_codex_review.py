@@ -115,7 +115,7 @@ def main() -> int:
         "branch": args.branch,
         "base_sha": args.base_sha,
         "head_sha": args.head_sha,
-        "model": args.model,
+        "model": args.model or "account_default",
         "sandbox": args.sandbox,
         "review_backend": "codex_sdk",
         "review_date": today(),
@@ -137,7 +137,10 @@ def run_codex_sdk(model: str, sandbox_name: str, prompt: str) -> str:
 
     sandbox = getattr(Sandbox, sandbox_name, Sandbox.read_only)
     with Codex() as codex:
-        thread = codex.thread_start(model=model, sandbox=sandbox)
+        thread_kwargs = {"sandbox": sandbox}
+        if model:
+            thread_kwargs["model"] = model
+        thread = codex.thread_start(**thread_kwargs)
         result = thread.run(prompt, sandbox=sandbox)
     return getattr(result, "final_response", str(result))
 
