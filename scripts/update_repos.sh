@@ -20,7 +20,12 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   parsed="$(parse_repo_line "$raw" || true)"
   [[ -z "$parsed" ]] && continue
 
-  IFS=$'\t' read -r repo_spec _ <<< "$parsed"
+  IFS=$'\t' read -r repo_spec cadence_raw <<< "$parsed"
+  if [[ "$(normalize_cadence "$cadence_raw" || true)" == "manual" ]]; then
+    log "手动审计项目，跳过更新：$repo_spec"
+    continue
+  fi
+
   gitlab_path="${repo_spec%@*}"
   branch="${repo_spec#*@}"
   if [[ "$gitlab_path" == "$branch" || -z "$branch" ]]; then
