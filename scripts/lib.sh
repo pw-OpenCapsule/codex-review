@@ -270,7 +270,7 @@ fetch_gitlab_branch_with_fallback() {
   local branch="$3"
   local resolved
 
-  if gitlab_fetch "$dir" "$remote" "$branch"; then
+  if GIT_RETRY_ATTEMPTS="${GIT_BRANCH_FETCH_RETRY_ATTEMPTS:-1}" gitlab_fetch "$dir" "$remote" "$branch"; then
     printf '%s' "$branch"
     return 0
   fi

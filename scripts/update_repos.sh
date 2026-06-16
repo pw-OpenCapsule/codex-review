@@ -8,6 +8,10 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 load_settings "$ROOT_DIR"
 
+if [[ "${SYNC_FROM_GITLAB:-0}" == "1" && "${GITLAB_USE_WARP:-0}" == "1" && "${GIT_WARP_BATCH_ACTIVE:-0}" != "1" ]]; then
+  GIT_WARP_BATCH_ACTIVE=1 exec git-warp batch --host "$GITLAB_HOST" -- "$0" "$@"
+fi
+
 ensure_dirs
 
 log "更新本地镜像（仅 fetch，不 push）"
@@ -32,7 +36,6 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   fi
 
   log "更新 $gitlab_path@$branch ($gh_repo)"
-  git -C "$dir" fetch origin --prune
 
   if [[ "${SYNC_FROM_GITLAB:-0}" == "1" ]]; then
     remote="$(gitlab_remote_name)"
@@ -46,5 +49,7 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
     if ! branch="$(fetch_gitlab_branch_with_fallback "$dir" "$remote" "$branch")"; then
       log "拉取 GitLab 失败：$gitlab_path@$branch"
     fi
+  else
+    git_retry git -C "$dir" fetch origin --prune
   fi
 done < "$REPOS_FILE"

@@ -15,6 +15,10 @@ if [[ -z "${CODEX_REVIEW_PYTHON:-}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
 fi
 CODEX_REVIEW_PYTHON="${CODEX_REVIEW_PYTHON:-python3}"
 
+if [[ "${SYNC_FROM_GITLAB:-0}" == "1" && "${GITLAB_USE_WARP:-0}" == "1" && "${GIT_WARP_BATCH_ACTIVE:-0}" != "1" ]]; then
+  GIT_WARP_BATCH_ACTIVE=1 exec git-warp batch --host "$GITLAB_HOST" -- "$0" "$@"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: daily_review.sh [--dry|--dry-run|-n]
@@ -320,7 +324,9 @@ prepare_repo() {
     git clone "https://github.com/$gh_repo.git" "$dir"
   fi
 
-  git_retry git -C "$dir" fetch origin --prune
+  if [[ "${SYNC_FROM_GITLAB:-0}" != "1" ]]; then
+    git_retry git -C "$dir" fetch origin --prune
+  fi
   printf '%s' "$dir"
 }
 
