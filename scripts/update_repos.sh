@@ -28,11 +28,21 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
   fi
 
   gh_repo="$(github_repo "$gitlab_path")"
-  dir="$(repo_dir "$gh_repo")"
+  if [[ "${SYNC_FROM_GITLAB:-0}" == "1" ]]; then
+    dir="$(gitlab_repo_dir "$gitlab_path")"
+  else
+    dir="$(repo_dir "$gh_repo")"
+  fi
 
   if [[ ! -d "$dir/.git" ]]; then
-    log "本地未初始化，跳过：$gitlab_path@$branch ($dir)"
-    continue
+    if [[ "${SYNC_FROM_GITLAB:-0}" == "1" ]]; then
+      log "初始化 GitLab 本地镜像：$gitlab_path ($dir)"
+      mkdir -p "$dir"
+      git -C "$dir" init >/dev/null
+    else
+      log "本地未初始化，跳过：$gitlab_path@$branch ($dir)"
+      continue
+    fi
   fi
 
   log "更新 $gitlab_path@$branch ($gh_repo)"

@@ -315,13 +315,25 @@ tracking_ref_for_branch() {
 
 prepare_repo() {
   local gh_repo="$1"
+  local gitlab_path="${2:-}"
   local dir
-  dir="$(repo_dir "$gh_repo")"
+
+  if [[ "${SYNC_FROM_GITLAB:-0}" == "1" && -n "$gitlab_path" ]]; then
+    dir="$(gitlab_repo_dir "$gitlab_path")"
+  else
+    dir="$(repo_dir "$gh_repo")"
+  fi
 
   if [[ ! -d "$dir/.git" ]]; then
-    ensure_gh_auth
-    log "正在克隆 $gh_repo"
-    git clone "https://github.com/$gh_repo.git" "$dir"
+    if [[ "${SYNC_FROM_GITLAB:-0}" == "1" && -n "$gitlab_path" ]]; then
+      log "初始化 GitLab 本地镜像：$gitlab_path ($dir)"
+      mkdir -p "$dir"
+      git -C "$dir" init >/dev/null
+    else
+      ensure_gh_auth
+      log "正在克隆 $gh_repo"
+      git clone "https://github.com/$gh_repo.git" "$dir"
+    fi
   fi
 
   if [[ "${SYNC_FROM_GITLAB:-0}" != "1" ]]; then
@@ -530,7 +542,7 @@ collect_queue() {
     fi
 
     gh_repo="$(github_repo "$gitlab_path")"
-    if ! dir="$(prepare_repo "$gh_repo")"; then
+    if ! dir="$(prepare_repo "$gh_repo" "$gitlab_path")"; then
       log "准备仓库失败，跳过：$gh_repo"
       fetch_failures=$((fetch_failures + 1))
       continue

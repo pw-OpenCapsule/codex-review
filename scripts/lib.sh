@@ -107,6 +107,47 @@ repo_dir() {
   printf '%s/%s' "$WORKDIR" "${gh_repo//\//_}"
 }
 
+gitlab_repo_dir() {
+  local gitlab_path="$1"
+  local gh_repo
+  local basename
+  local count
+
+  gh_repo="$(github_repo "$gitlab_path")"
+  basename="${gitlab_path##*/}"
+
+  if [[ -f "${REPOS_FILE:-}" ]]; then
+    count="$(
+      awk -v name="$basename" '
+        /^[[:space:]]*($|#)/ { next }
+        {
+          line = $0
+          sub(/[[:space:]]+#.*/, "", line)
+          split(line, parts, /[[:space:]]+/)
+          spec = parts[1]
+          sub(/@.*/, "", spec)
+          repo = spec
+          sub(/^.*\//, "", repo)
+          if (repo == name) seen[spec] = 1
+        }
+        END {
+          for (spec in seen) count++
+          print count + 0
+        }
+      ' "$REPOS_FILE"
+    )"
+  else
+    count=0
+  fi
+
+  if (( count > 1 )); then
+    printf '%s/%s__%s' "$WORKDIR" "$GITHUB_ORG" "${gitlab_path//\//__}"
+    return 0
+  fi
+
+  printf '%s' "$(repo_dir "$gh_repo")"
+}
+
 state_file() {
   local gitlab_path="$1"
   local branch="$2"
