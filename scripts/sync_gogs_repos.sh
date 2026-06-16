@@ -132,6 +132,24 @@ def list_user_repos():
 def list_org_repos(org: str):
     return paged(f"{base}/api/v1/orgs/{urllib.parse.quote(org)}/repos")
 
+def list_search_repos(query: str):
+    url = f"{base}/api/v1/repos/search?q={urllib.parse.quote(query)}"
+    page = 1
+    limit = 50
+    items = []
+    while True:
+        sep = "&" if "?" in url else "?"
+        data = api_get(f"{url}{sep}page={page}&limit={limit}")
+        if isinstance(data, dict):
+            data = data.get("data", [])
+        if not isinstance(data, list):
+            break
+        items.extend(data)
+        if len(data) < limit:
+            break
+        page += 1
+    return items
+
 def list_branches(owner: str, repo: str):
     return paged(f"{base}/api/v1/repos/{owner}/{repo}/branches")
 
@@ -226,6 +244,19 @@ else:
             owner_names.add(owner)
     for owner in sorted(owner_names):
         repos.extend(list_org_repos(owner))
+    if os.environ.get("GOGS_SEARCH_DISCOVERY", "1") != "0":
+        search_queries = (
+            list("abcdefghijklmnopqrstuvwxyz")
+            + list("0123456789")
+            + ["-", "_", "api", "web", "service", "admin", "game", "app", "server",
+               "worker", "bot", "live", "user", "pwtk", "pw", "tg", "fyd", "ka",
+               "pp", "vroom"]
+        )
+        for query in search_queries:
+            try:
+                repos.extend(list_search_repos(query))
+            except Exception as exc:
+                print(f"search 查询失败：{query}: {exc}", file=sys.stderr)
 
 seen = set()
 lines = []
