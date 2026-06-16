@@ -301,11 +301,32 @@ gitlab_fetch() {
       log "GITLAB_USE_WARP=1 但找不到 git-warp：$warp_bin"
       return 1
     fi
-    GIT_WARP_PORT="${GIT_WARP_PORT:-443}" \
+    GIT_WARP_HOST="${GIT_WARP_HOST:-$GITLAB_HOST}" \
+      GIT_WARP_PORT="${GIT_WARP_PORT:-443}" \
       GIT_WARP_WAIT="${GIT_WARP_WAIT:-60}" \
-      "$warp_bin" -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
+      git_retry "$warp_bin" -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
     return
   fi
 
-  git -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
+  git_retry git -C "$dir" -c credential.helper= fetch "$remote" "$refspec"
+}
+
+git_retry() {
+  local attempts="${GIT_RETRY_ATTEMPTS:-3}"
+  local delay="${GIT_RETRY_DELAY:-5}"
+  local attempt=1
+  local rc=0
+
+  while (( attempt <= attempts )); do
+    "$@" && return 0
+    rc=$?
+    if (( attempt >= attempts )); then
+      return "$rc"
+    fi
+    log "git 命令失败，${delay}s 后重试 (${attempt}/${attempts})：$*"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+
+  return "$rc"
 }

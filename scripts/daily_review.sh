@@ -320,7 +320,7 @@ prepare_repo() {
     git clone "https://github.com/$gh_repo.git" "$dir"
   fi
 
-  git -C "$dir" fetch origin --prune
+  git_retry git -C "$dir" fetch origin --prune
   printf '%s' "$dir"
 }
 
@@ -478,6 +478,7 @@ sync_from_gitlab() {
 
 collect_queue() {
   local gitlab_path branch gh_repo dir head_sha base_sha score loc risk initial_ref
+  local fetch_failures=0
 
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     local parsed repo_spec cadence_raw cadence
@@ -523,10 +524,15 @@ collect_queue() {
     fi
 
     gh_repo="$(github_repo "$gitlab_path")"
-    dir="$(prepare_repo "$gh_repo")"
+    if ! dir="$(prepare_repo "$gh_repo")"; then
+      log "准备仓库失败，跳过：$gh_repo"
+      fetch_failures=$((fetch_failures + 1))
+      continue
+    fi
 
     SYNC_RESOLVED_BRANCH="$branch"
     if ! sync_from_gitlab "$dir" "$gitlab_path" "$branch"; then
+      fetch_failures=$((fetch_failures + 1))
       continue
     fi
     branch="$SYNC_RESOLVED_BRANCH"
@@ -606,6 +612,10 @@ collect_queue() {
     log "加入队列 $gitlab_path@$branch 频率=$cadence 评分=$score 行数=$loc 风险文件=$risk"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$score" "$gitlab_path" "$branch" "$base_sha" "$head_sha" "$cadence" >> "$QUEUE_FILE"
 done < "$REPOS_FILE"
+
+  if (( fetch_failures > 0 )) && [[ ! -s "$QUEUE_FILE" ]]; then
+    die "有 ${fetch_failures} 个仓库拉取失败，且队列为空；本轮审查不应视为成功"
+  fi
 }
 
 artifact_slug() {
