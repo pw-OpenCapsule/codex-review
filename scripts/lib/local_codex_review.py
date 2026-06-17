@@ -29,7 +29,7 @@ PROMPT_TEMPLATE = """\
 
 忽略格式化、文档、生成文件、小型重构。不要要求创建 PR，不要调用外部系统。
 
-严格输出 JSON，不要任何额外文字：
+严格输出 JSON，不要任何额外文字；顶层只允许 issues 字段：
 {{
   "issues": [
     {{
@@ -40,9 +40,6 @@ PROMPT_TEMPLATE = """\
       "line_end": 1,
       "evidence": "为什么这是真实风险"
     }}
-  ],
-  "rejected": [
-    {{"original": "候选问题或疑点", "reason": "为什么不作为风险项"}}
   ]
 }}
 
@@ -78,7 +75,7 @@ def main() -> int:
 
     workdir = Path(args.workdir)
     if not (workdir / ".git").exists():
-      print(json.dumps({"issues": [], "rejected": [], "error": "workdir_not_git"}))
+      print(json.dumps({"issues": [], "error": "workdir_not_git"}))
       return 2
 
     diff_stat = git_output(workdir, ["diff", "--stat", args.base_sha, args.head_sha])
@@ -100,13 +97,13 @@ def main() -> int:
     try:
         raw = run_codex_sdk(args.model, args.sandbox, prompt)
     except Exception as exc:
-        print(json.dumps({"issues": [], "rejected": [], "error": "codex_sdk_failed",
+        print(json.dumps({"issues": [], "error": "codex_sdk_failed",
                           "detail": str(exc)}, ensure_ascii=False))
         return 3
 
     parsed = extract_json(raw)
     if parsed is None:
-        print(json.dumps({"issues": [], "rejected": [], "error": "parse_failed",
+        print(json.dumps({"issues": [], "error": "parse_failed",
                           "raw": raw}, ensure_ascii=False))
         return 4
 
@@ -204,7 +201,6 @@ def normalize_artifact(parsed: dict, metadata: dict) -> dict:
     return {
         "metadata": metadata,
         "issues": issues,
-        "rejected": parsed.get("rejected") or [],
         "markdown": "",
     }
 

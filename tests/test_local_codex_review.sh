@@ -109,12 +109,13 @@ assert data["metadata"]["review_backend"] == "codex_sdk"
 assert len(data["issues"]) == 1
 assert data["issues"][0]["issue_key"]
 assert data["issues"][0]["summary_zh"] == "空指针风险"
-assert len(data["rejected"]) == 1
+assert "rejected" not in data
 assert "## P1 空指针风险" in markdown
 assert capture["model"] == "gpt-5.3-codex"
 assert capture["thread_sandbox"] == "read_only"
 assert capture["run_sandbox"] == "read_only"
 assert "git diff --stat" in capture["prompt"]
 assert "src/app.py" in capture["prompt"]
+assert '"rejected"' not in capture["prompt"]
 print("OK")
 PY
