@@ -7,8 +7,9 @@ A separate event-driven service; existing daily/weekly jobs are unchanged.
 - Only the configured same-owner repository and PRs targeting test are processed.
 - SQLite coalesces events and deduplicates by repository, PR, source SHA and target SHA.
 - Periodic discovery recovers missed deliveries. Both the target and source SHA are checked again before publication; obsolete results are discarded.
-- Gogs web login uses the existing Git credential helper. HTML forms support installations without a pull-request API.
+- Production uses a dedicated robot API token for Git fetches, PR metadata and comments. Gogs disables comment APIs when Issues is disabled; enable internal Issues for this integration. The PR branch names missing from its API are cached from signed Webhook metadata. Existing PRs must be seeded once during setup. Unknown metadata fails closed and needs PR webhook redelivery; the service never silently substitutes another user.
 - Comments have a visible marker; uncertain comment responses are reconciled before retry.
+- Zero findings never notify Lark. P3 and speculative/style feedback are suppressed. P0/P1 notify immediately; P2 uses a maximum 30-second batching window, independently of running reviews. Unchanged source-anchored findings are not re-notified; resolved then reintroduced findings and severity increases notify again. Mentions come only from the trusted author mapping file.
 - Lark webhook responses must contain a successful application-level code, not merely HTTP 200. Notification retries do not repeat the review or confirmed PR comment.
 - Lark custom webhooks do not supply an idempotency key: a lost response after server-side delivery can cause a repeated notification. The submission SHA makes these identifiable.
 - Engine failures retry once, then report failure rather than a clean review. Manual retry is available below.
@@ -22,13 +23,20 @@ Use Python 3.10+ and an authenticated local Codex CLI. A dedicated virtualenv is
 pip install -r pr_review/requirements.txt
 ```
 
-`review.py` explicitly selects the installed `codex` binary via CodexConfig; it does not force an old model. Set CODEX_REVIEW_MODEL only for an intentional model override. On hosts where the bundled CLI download is unavailable, install openai-codex with --no-deps plus requests/beautifulsoup4/pydantic, and keep the verified local CLI on PATH.
+`review.py` explicitly selects the installed `codex` binary via CodexConfig; the configured model is explicitly gpt-6-astra with low reasoning by default. Set model/effort in the private service config for an intentional override. On hosts where the bundled CLI download is unavailable, install openai-codex with --no-deps plus requests/beautifulsoup4/pydantic, and keep the verified local CLI on PATH.
 
 Put this JSON outside the checkout, chmod 600, in a private state directory (chmod 700):
 
 ```json
 {
   "repo": "example/project",
+  "model": "gpt-6-astra",
+  "effort": "low",
+  "gogs_credentials_file": "/private/gogs-credentials.json",
+  "lark_user_map": "/private/lark_user_map.tsv",
+  "digest_delay_seconds": 30,
+  "reviewers": ["maintainer-a", "maintainer-b"],
+  "gate_secret": "GENERATE-A-DIFFERENT-RANDOM-SECRET",
   "gogs_origin": "https://git.example.com",
   "state_dir": "/var/lib/pr-review",
   "webhook_secret": "GENERATE-A-RANDOM-SECRET",
@@ -59,3 +67,29 @@ python -m unittest discover -s tests -p test_pr_review.py -v
 ```
 
 Test the Gogs delivery after service/Tunnel startup. Confirm 202 delivery, a single review per source/target revision, the PR comment permalink and Lark notification. Never run production acceptance scripts as an automatic check.
+
+## Robot credential file
+
+Outside Git, chmod 600, containing `host`, `username` and `token`. The token belongs to the dedicated robot, with read access and comment permission for each enabled project. The daemon verifies its API identity. Git uses a host-scoped helper; the model process does not inherit this file path or token. Human account credentials are not used as a fallback.
+
+## Two-person eligibility (not yet a native Gogs merge lock)
+
+Each review contains an immutable review key binding source and target revisions. The author comments:
+
+```
+/review-resolve REVIEW_KEY
+F1 fixed Concrete explanation of the fix
+F2 false-positive Concrete evidence explaining the false positive
+```
+
+For a clean review, only the first line is needed. A different explicitly authorized maintainer then posts:
+
+```
+/review-approve REVIEW_KEY Concrete verification performed
+```
+
+Author self-approval, bot approval, unknown maintainers, missing findings, approvals preceding the author's resolution and edited resolutions after approval all fail. A new source or target revision invalidates the old key. AI findings can be rejected with evidence; they are not an absolute veto.
+
+`POST /merge-gate/check` accepts `{repo, pr, head, base}` and an HMAC SHA256 in X-Gogs-Signature using the separate gate_secret. It queries current refs and authenticated comments before returning allowed/reason. Failures deny eligibility. This is a verification endpoint, **not an enforcement boundary by itself**.
+
+This Gogs instance has no required-status-check setting and its Git hook management is unavailable. Until the server invokes this checker atomically at merge time, or permissions are redesigned so only an enforcing integration can merge, ordinary Gogs merges can bypass these acknowledgements. Do not claim the merge button is locked. Repository-administrator permissions and deployment boundaries remain outside this service.

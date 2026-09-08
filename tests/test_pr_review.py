@@ -3,7 +3,7 @@ from pathlib import Path
 from unittest.mock import patch,Mock
 import threading,requests
 from bs4 import BeautifulSoup
-from pr_review.service import Store,event_pr,signature_ok,validate_review,parse_pr,send_lark,Worker,render,Gogs,server
+from pr_review.service import Store,event_pr,signature_ok,validate_review,parse_pr,send_lark,Worker,render,Gogs,server,save_pr_metadata
 
 class ReviewTests(unittest.TestCase):
  def setUp(self):
@@ -42,11 +42,11 @@ class ReviewTests(unittest.TestCase):
   w=object.__new__(Worker);w.gogs=Mock();w.gogs.page.return_value={'closed':False};w.refs=lambda _:('new','base');w.store=Mock()
   w.publish({'pr':31,'head':'old','base':'base','key':'k'})
   w.gogs.comment.assert_not_called();w.store.update.assert_called_once_with('k',status='stale',notified=1)
- def test_notify_retry_does_not_duplicate_comment(self):
+ def test_zero_findings_does_not_notify_or_duplicate_comment(self):
   w=object.__new__(Worker);w.gogs=Mock();w.gogs.page.return_value={'closed':False,'title':'PR'};w.refs=lambda _:('a','b');w.store=Mock();w.cfg={'lark_webhook':'https://example'}
   with patch('pr_review.service.send_lark') as send:
    w.publish({'pr':31,'head':'a','base':'b','key':'k','result':'{"issues":[]}','comment_url':'https://git/31#c'})
-  w.gogs.comment.assert_not_called();send.assert_called_once()
+  w.gogs.comment.assert_not_called();send.assert_not_called()
  def test_failed_review_has_no_pass_claim(self):
   _,body=render({},dict(key='k',head='a',base='b'),{'error':'timeout'})
   self.assertIn('评审失败',body);self.assertNotIn('未发现明确缺陷',body)
@@ -72,5 +72,18 @@ class ReviewTests(unittest.TestCase):
     for _ in range(2):self.assertEqual(requests.post(url,data=body,headers={'X-Gogs-Signature':sig,'X-Gogs-Event':'pull_request'},timeout=2).status_code,202)
     self.assertEqual(st.pop(),31);self.assertIsNone(st.pop())
    finally:srv.shutdown();thread.join();srv.server_close()
+
+ def test_robot_api_comment_does_not_reuse_human_marker(self):
+  c=object.__new__(Gogs);c.credentials_file='private';c.origin='https://git.example';c.username='robot';c.session=Mock()
+  c.comments=lambda n:[{'id':1,'body':'marker','user':{'username':'author'}}]
+  c.page=lambda n:{'closed':False};c.session.post.return_value.json.return_value={'id':2}
+  url=c.comment(31,'marker','body')
+  self.assertEqual(url,'https://git.example/games/aeroplane/pulls/31#issuecomment-2')
+  c.session.post.assert_called_once()
+ def test_signed_webhook_metadata_supplies_missing_gogs_pr_api_fields(self):
+  with tempfile.TemporaryDirectory() as d:
+   st=Store(Path(d)/'state')
+   save_pr_metadata({'repository':{'full_name':'games/aeroplane'},'pull_request':{'number':31,'head_branch':'feat/x','base_branch':'test','head_repo':{'full_name':'games/aeroplane'},'base_repo':{'full_name':'games/aeroplane'}}},st)
+   self.assertEqual(st.meta('pr_refs:31')['head'],'feat/x')
 
 if __name__=='__main__':unittest.main()
