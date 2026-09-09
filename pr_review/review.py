@@ -1,8 +1,9 @@
 """Bounded SDK child. Uses the explicitly selected local CLI, never an implicit old model."""
-import argparse,json,os,shutil,subprocess,tomllib
+import argparse,json,os,shutil,subprocess,tomllib,sys
 from pathlib import Path
 from openai_codex import Codex,CodexConfig,Sandbox,ApprovalMode
-from routing import pipeline,atomic_json
+from routing import pipeline,atomic_json,SPARK
+from budget import collect_bounded,ReviewBudgetExceeded
 
 SCHEMA={'type':'object','properties':{'issues':{'type':'array','items':{'type':'object','properties':{
  'severity':{'type':'string','enum':['P0','P1','P2']},'summary':{'type':'string'},'file':{'type':'string','description':'仓库相对路径，不是绝对路径'},
@@ -25,21 +26,24 @@ def main():
  names=subprocess.check_output(['git','diff','--name-status',a.base,a.head],cwd=cwd,text=True)
  # Include a bounded patch so trivial changes do not require multiple tool round trips.
  patch=subprocess.check_output(['git','diff','--unified=8',a.base,a.head,'--','.',':(exclude)drizzle/meta/**',':(exclude)*.snapshot.json'],cwd=cwd,text=True)
- if len(patch)>12000:patch=patch[:12000]+'\n[差异预览截断；剩余内容需按文件读取，不得视为已审查]'
+ if len(patch)>12000:patch=patch[:12000]+'\n[差异预览截断；Spark 不得自行读取更多文件或声称完整审查，需将具体缺失范围交给深度阶段]'
  prompt=f'审查 {a.base}..{a.head}。工作区已经固定到 head。先读 diff，再核对相关调用与边界，不要只按文件名判断。\n{stat}\n{names}\n差异预览（不含生成快照；全量清单在上方）：\n{patch}'
  home=Path(os.environ.get('CODEX_HOME',str(Path.home()/'.codex')))
  conf={}
  if (home/'config.toml').exists():conf=tomllib.loads((home/'config.toml').read_text())
- cfg={'mcp_servers':{k:{'enabled':False} for k in conf.get('mcp_servers',{})},'web_search':'disabled','model_reasoning_effort':os.environ.get('CODEX_REVIEW_EFFORT','low')}
+ cfg={'features':{'multi_agent':False,'shell_snapshot':False},'mcp_servers':{k:{'enabled':False} for k in conf.get('mcp_servers',{})},'web_search':'disabled','model_reasoning_effort':os.environ.get('CODEX_REVIEW_EFFORT','low')}
  def run(model,instructions,schema):
+  stage_cfg={**cfg,'features':{**cfg['features'],'shell_tool':model!=SPARK,'unified_exec':model!=SPARK}}
   with Codex(config=CodexConfig(codex_bin=shutil.which('codex'),cwd=str(cwd))) as codex:
    thread=codex.thread_start(cwd=str(cwd),sandbox=Sandbox.read_only,approval_mode=ApprovalMode.deny_all,
-        developer_instructions=RULES,ephemeral=True,config=cfg,model=model)
-   result=thread.run(prompt+'\n'+instructions,output_schema=schema,effort='low')
-   if str(result.status).split('.')[-1].lower()!='completed' or result.error:
-    raise RuntimeError('review turn did not complete')
-   usage=result.usage.model_dump(mode='json') if result.usage is not None else None
-   parsed=json.loads(result.final_response)
+        base_instructions=('你是只分析输入文本的代码差异分类器，不使用任何工具。不要计划检索或尝试执行命令。信息不足时给出具体升级证据，禁止自行展开。' if model==SPARK else None),
+        developer_instructions=(RULES+'\n本轮 Spark 只审查提供的片段；不要自行查运行手册或代码。工具已关闭，禁止尝试调用。' if model==SPARK else RULES),ephemeral=True,config=stage_cfg,model=model,service_tier='default')
+   handle=thread.turn(prompt+'\n'+instructions,output_schema=schema,effort='low')
+   def record_usage(usage):
+    atomic_json(str(a.output)+'.'+('spark' if model==SPARK else 'deep')+'.usage.json',{'model':model,'usage':usage})
+   raw,usage=collect_bounded(handle,max_tools=0 if model==SPARK else 8,
+       max_tokens=40000 if model==SPARK else 250000,seconds=45 if model==SPARK else 180,checkpoint=record_usage)
+   parsed=json.loads(raw)
    for e in parsed.get('issues',[])+parsed.get('evidence',[]):
     file=Path(e['file'])
     resolved=(cwd/file).resolve()
@@ -59,4 +63,8 @@ def main():
   parsed.update(model=model,effort='low',usage_by_stage={'fixed':{'model':model,'usage':usage}})
  atomic_json(a.output,parsed)
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+ try:main()
+ except ReviewBudgetExceeded as e:
+  print(f'ReviewBudgetExceeded: {e}',file=sys.stderr)
+  sys.exit(75)
