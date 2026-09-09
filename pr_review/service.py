@@ -10,9 +10,11 @@ from bs4 import BeautifulSoup
 try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
+    from .direct_messages import author_recipient,dm_text,delivery_key,send_direct
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
+    from direct_messages import author_recipient,dm_text,delivery_key,send_direct
 
 REPO = os.environ.get('PR_REVIEW_REPO', 'example/project')
 SHA = re.compile(r'^[0-9a-f]{40}$')
@@ -219,7 +221,7 @@ CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head 
     def set_meta(self,name,value):
         with self.db() as c:c.execute('INSERT OR REPLACE INTO notice_meta VALUES (?,?)',(name,json.dumps(value)))
     def notices(self):
-        with self.db() as c:return [dict(r) for r in c.execute("SELECT * FROM jobs WHERE status IN ('ready','failed') AND notified=0 AND comment_url IS NOT NULL")]
+        with self.db() as c:return [dict(r) for r in c.execute("SELECT * FROM jobs WHERE status IN ('ready','failed') AND notified=0 AND comment_url IS NOT NULL AND retry_at<=?",(time.time(),))]
 
 def validate_review(value):
     if not isinstance(value,dict) or not isinstance(value.get('issues'),list):raise ValueError('review output missing issues')
@@ -357,7 +359,7 @@ class Worker:
         if not jobs:
             if self.store.meta('digest_due') is not None:self.store.set_meta('digest_due',None)
             return
-        if time.time()<self.store.meta('notify_retry_at',0):return
+        if self.cfg.get('notification_mode','group')!='direct' and time.time()<self.store.meta('notify_retry_at',0):return
         due=self.store.meta('digest_due')
         if due is None:
             due=time.time()+self.cfg.get('digest_delay_seconds',30)
@@ -378,13 +380,28 @@ class Worker:
             if len(items)>=10:break
         for key in resolved:self.store.update(key,notified=1)
         if items:
-            try:send_lark(self.cfg['lark_webhook'],digest_card(items,read_people(self.cfg.get('lark_user_map',''))))
-            except Exception:
-                self.store.set_meta('notify_retry_at',time.time()+120)
-                raise
-            for p,job,result in items:
-                self.store.set_meta('sent:'+str(job['pr']),sorted(fingerprints(meaningful(json.loads(job['result'])))))
-                self.store.update(job['key'],notified=1)
+            if self.cfg.get('notification_mode','group')=='direct':
+                people=read_people(self.cfg.get('lark_user_map',''))
+                for p,job,result in items:
+                    try:
+                        recipient=author_recipient(p,people)
+                        key=delivery_key(job,recipient)
+                        if not self.store.meta('dm_receipt:'+key):
+                            mid=send_direct(self.cfg['lark_cli'],recipient,dm_text(p,job,result),key)
+                            self.store.set_meta('dm_receipt:'+key,mid)
+                        self.store.set_meta('sent:'+str(job['pr']),sorted(fingerprints(meaningful(json.loads(job['result'])))))
+                        self.store.update(job['key'],notified=1)
+                    except Exception as e:
+                        self.store.update(job['key'],retry_at=time.time()+120)
+                        print(f'PR {job["pr"]} direct notification deferred: {e}',flush=True)
+            else:
+                try:send_lark(self.cfg['lark_webhook'],digest_card(items,read_people(self.cfg.get('lark_user_map',''))))
+                except Exception:
+                    self.store.set_meta('notify_retry_at',time.time()+120)
+                    raise
+                for p,job,result in items:
+                    self.store.set_meta('sent:'+str(job['pr']),sorted(fingerprints(meaningful(json.loads(job['result'])))))
+                    self.store.update(job['key'],notified=1)
         self.store.set_meta('digest_due',time.time()+self.cfg.get('digest_delay_seconds',30))
 
     def check_gate(self,number,head,base):
@@ -460,7 +477,11 @@ def main():
     config=json.loads(Path(sys.argv[1]).read_text())
     REPO=config['repo']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',REPO):raise SystemExit('invalid repository')
-    if not config.get('webhook_secret') or not config.get('lark_webhook'):raise SystemExit('webhook secret and Lark URL required')
+    if not config.get('webhook_secret'):raise SystemExit('webhook secret required')
+    mode=config.get('notification_mode','group')
+    if mode not in ('direct','group'):raise SystemExit('invalid notification mode')
+    if mode=='direct' and not config.get('lark_cli'):raise SystemExit('Lark CLI required for direct messages')
+    if mode=='group' and not config.get('lark_webhook'):raise SystemExit('Lark webhook required for group notifications')
     if config.get('gogs_credentials_file'):os.environ['PR_REVIEW_CREDENTIALS_FILE']=config['gogs_credentials_file']
     root=Path(config['state_dir']);root.mkdir(parents=True,exist_ok=True)
     store=Store(root/'state.sqlite')
