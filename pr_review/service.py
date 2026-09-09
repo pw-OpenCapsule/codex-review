@@ -11,11 +11,13 @@ try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
     from .progress import progress_body
+    from .reuse import policy_digest,cache_key,stable_remaining
     from .direct_messages import author_recipient,dm_text,delivery_key,send_direct
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
     from progress import progress_body
+    from reuse import policy_digest,cache_key,stable_remaining
     from direct_messages import author_recipient,dm_text,delivery_key,send_direct
 
 REPO = os.environ.get('PR_REVIEW_REPO', 'example/project')
@@ -213,18 +215,20 @@ CREATE TABLE IF NOT EXISTS events(pr INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
  status TEXT NOT NULL, result TEXT, comment_url TEXT, notified INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, retry_at REAL DEFAULT 0);
 ''')
+            if 'due' not in {r[1] for r in c.execute('PRAGMA table_info(events)')}:
+                c.execute('ALTER TABLE events ADD COLUMN due REAL NOT NULL DEFAULT 0')
     @contextmanager
     def db(self):
         c=sqlite3.connect(self.path,timeout=30);c.row_factory=sqlite3.Row
         try:
             with c:yield c
         finally:c.close()
-    def enqueue(self,n):
-        with self.db() as c:c.execute('INSERT OR IGNORE INTO events VALUES (?)',(n,))
+    def enqueue(self,n,delay=0):
+        with self.db() as c:c.execute('INSERT INTO events(pr,due) VALUES (?,?) ON CONFLICT(pr) DO UPDATE SET due=min(due,excluded.due)',(n,time.time()+delay))
     def pop(self):
         with self.db() as c:
             c.execute('BEGIN IMMEDIATE')
-            row=c.execute('SELECT pr FROM events ORDER BY pr LIMIT 1').fetchone()
+            row=c.execute('SELECT pr FROM events WHERE due<=? ORDER BY due,pr LIMIT 1',(time.time(),)).fetchone()
             if row:c.execute('DELETE FROM events WHERE pr=?',(row['pr'],))
             return row['pr'] if row else None
     def cancel_pr(self,n):
@@ -323,7 +327,11 @@ class Worker:
                 if time.monotonic()>=next_check:
                     try:
                         p=self.gogs.page(number)
-                        changed=p['closed'] or self.current_refs(p)!=(head,base)
+                        latest=None if p['closed'] else self.current_refs(p)
+                        changed=p['closed'] or latest[0]!=head
+                        if not changed and latest[1]!=base:
+                            git(self.mirror,'fetch','--prune','origin')
+                            changed=git(self.mirror,'merge-base',latest[1],head)!=git(self.mirror,'merge-base',base,head)
                     except UnsupportedPR:
                         self.kill_child();raise ReviewSuperseded('PR scope changed')
                     except (requests.RequestException,subprocess.SubprocessError):
@@ -350,6 +358,11 @@ class Worker:
             self.store.update(job['key'],status='pending',notified=0,comment_url=None)
             job['status']='pending'
         if job['status'] not in ['pending','running']:return
+        state,remaining=stable_remaining(self.store.meta('stable:'+str(n)),head,time.time(),self.cfg.get('settle_seconds',60))
+        self.store.set_meta('stable:'+str(n),state)
+        if remaining>0:
+            self.store.enqueue(n,delay=remaining)
+            return
         self.store.update(job['key'],status='running')
         self.store.enqueue_status(n)
         cwd=Path(self.cfg['state_dir'])/'work'/job['key']
@@ -358,9 +371,15 @@ class Worker:
         try:
             if not cwd.exists():git(self.mirror,'worktree','add','--detach',str(cwd),head)
             merge=git(cwd,'merge-base',base,head)
+            shared=Path(self.cfg['state_dir'])/'cache'/cache_key(REPO,head,merge,policy_digest(self.cfg))
+            shared.mkdir(parents=True,exist_ok=True)
+            cached_path=shared/'review.json'
+            cache_hit=cached_path.exists()
+            self.store.set_meta('cache:'+job['key'],shared.name)
+            if (shared/'failure.json').exists():raise ValueError('cached failed scope; explicit retry required')
             # Isolated child bounds the entire SDK call, including startup and stalled turns.
             cmd=[sys.executable,str(Path(__file__).with_name('review.py')),'--cwd',str(cwd),
-                '--base',merge,'--head',head,'--output',str(result_path)]
+                '--base',merge,'--head',head,'--output',str(cached_path)]
             engine_env={k:v for k,v in os.environ.items() if k in
                 {'PATH','HOME','USER','LOGNAME','TMPDIR','LANG','CODEX_HOME','CODEX_REVIEW_MODEL'}}
             if self.cfg.get('codex_bin'):engine_env['CODEX_REVIEW_BIN']=self.cfg['codex_bin']
@@ -368,7 +387,7 @@ class Worker:
             engine_env['CODEX_REVIEW_EFFORT']=self.cfg.get('effort','low')
             engine_env['CODEX_REVIEW_ROUTING']=self.cfg.get('routing','fixed')
             max_attempts=1 if engine_env['CODEX_REVIEW_ROUTING']=='complexity' else 2
-            for attempt in range(max_attempts):
+            for attempt in range(0 if cache_hit else max_attempts):
                 self.child=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                     start_new_session=True,env=engine_env)
                 try:
@@ -384,7 +403,13 @@ class Worker:
                     self.child=None
                 if attempt+1==max_attempts:raise ValueError('review engine failed; explicit retry required')
                 time.sleep(10)
-            result=meaningful(validate_review(json.loads(result_path.read_text())))
+            result=meaningful(validate_review(json.loads(cached_path.read_text())))
+            result['cache']={'hit':cache_hit,'key':shared.name,'new_model_calls':0 if cache_hit else None}
+            if cache_hit:
+                result['cached_usage_by_stage']=result.pop('usage_by_stage',{})
+                result['usage_by_stage']={}
+            result_path.write_text(json.dumps(result,ensure_ascii=False))
+            print(f'review {n} cache {"hit" if cache_hit else "miss"}: {shared.name}',flush=True)
             people=read_people(self.cfg.get('lark_user_map',''))
             for issue in result['issues']:
                 file=cwd/issue['file']
@@ -402,12 +427,14 @@ class Worker:
             result.setdefault('model',engine_env['CODEX_REVIEW_MODEL']);result.setdefault('effort',engine_env['CODEX_REVIEW_EFFORT'])
             self.store.update(job['key'],status='ready',result=json.dumps(result,ensure_ascii=False))
         except ReviewBudgetStopped:
+            if 'shared' in locals():(shared/'failure.json').write_text(json.dumps({'error':'budget_exceeded'}))
             self.store.update(job['key'],status='failed',result=json.dumps({'error':'budget_exceeded'}))
         except ReviewSuperseded:
             self.store.update(job['key'],status='stale',notified=1)
             self.store.enqueue(n)
             print(f'review {n} cancelled: PR closed or revision replaced',flush=True)
         except Exception as e:
+            if 'shared' in locals() and not cache_hit:(shared/'failure.json').write_text(json.dumps({'error':type(e).__name__}))
             self.kill_child()
             print(f'review {n} failed: {type(e).__name__}',flush=True)
             self.store.update(job['key'],status='failed',result=json.dumps({'error':type(e).__name__}))
@@ -606,6 +633,10 @@ def main():
         with store.db() as c:c.execute("UPDATE jobs SET status='pending' WHERE status='running'")
     if len(sys.argv)>2 and sys.argv[2]=='retry':
         n=int(sys.argv[3])
+        with store.db() as c:failed=[r['key'] for r in c.execute("SELECT key FROM jobs WHERE pr=? AND status='failed'",(n,))]
+        for key in failed:
+            cached=store.meta('cache:'+key)
+            if cached and re.fullmatch(r'[0-9a-f]{64}',cached):(root/'cache'/cached/'failure.json').unlink(missing_ok=True)
         with store.db() as c:c.execute("UPDATE jobs SET status='pending',result=NULL,comment_url=NULL,notified=0 WHERE pr=? AND status='failed'",(n,))
         store.enqueue(n);print('retry queued');return
     worker=Worker(config,store)
