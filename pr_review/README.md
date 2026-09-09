@@ -116,3 +116,9 @@ The notification policy is unchanged: only private bot messages to the PR author
 ## Visible PR progress
 
 A separate persistent status queue updates one robot-owned comment per PR without waiting for the review engine. New PRs and updated revisions show “queued, please hold merging”; running reviews show “reviewing”; completion links to the full report, and failures explicitly remain unapproved. A clean review still asks for human checks and two-person confirmation. Progress never sends a DM or group message, and unchanged text is not patched repeatedly. This is a visible warning, not an enforced merge lock.
+
+## Cost bounds and cancellation
+
+Both stages explicitly select the default service tier (not Fast). Spark receives the bounded patch with shell, unified exec, web and subagent access disabled: 0 tool operations, 40,000 cumulative context-work tokens, 45 seconds. Deep review permits up to 8 tool operations, 250,000 cumulative context-work tokens and 180 seconds. Token caps include cached input and are workload caps, not a conversion to billable credits. Usage notifications are checkpointed while running, including interrupted work. Exceeding a limit is incomplete review, never a clean pass.
+
+A closed/merged PR webhook cancels queued jobs. The worker checks this cancellation flag every 2 seconds while waiting for its child; it also checks the authoritative PR state and both Git refs every 5 seconds (subject to network latency). Closed, merged or replaced revisions terminate the SDK process group and become stale without a failure notification. Before publishing, the existing freshness check remains in place. There is also a 300-second parent watchdog.

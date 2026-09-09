@@ -22,6 +22,8 @@ REPO = os.environ.get('PR_REVIEW_REPO', 'example/project')
 SHA = re.compile(r'^[0-9a-f]{40}$')
 
 class UnsupportedPR(ValueError): pass
+class ReviewSuperseded(RuntimeError): pass
+class ReviewBudgetStopped(RuntimeError): pass
 
 def signature_ok(secret, body, supplied):
     return bool(secret) and hmac.compare_digest(hmac.new(secret.encode(), body, hashlib.sha256).hexdigest(), supplied)
@@ -41,6 +43,10 @@ def save_pr_metadata(payload,store):
     if not isinstance(pr,dict):return
     n=pr.get('number') or payload.get('number')
     if type(n) is not int or n<=0:return
+    if pr.get('state') in ('open','closed'):
+        is_closed=pr['state']=='closed' or pr.get('merged') is True
+        store.set_meta('pr_closed:'+str(n),is_closed)
+        if is_closed:store.cancel_pr(n)
     head,base=pr.get('head_branch'),pr.get('base_branch')
     if not isinstance(head,str) or not isinstance(base,str):return
     for name in (head,base):
@@ -109,6 +115,10 @@ class Gogs:
             r=self.session.get(f'{self.origin}/api/v1/repos/{REPO}/issues/{number}',timeout=30);r.raise_for_status()
             issue=r.json()
             if not issue.get('pull_request'):raise UnsupportedPR('not a PR')
+            if issue['state']!='open' or issue['pull_request'].get('merged'):
+                return {'number':number,'head':'','base':'','title':f'#{number} '+issue['title'],
+                        'url':f'{self.origin}/{REPO}/pulls/{number}','closed':True,
+                        'author':issue['user'].get('username') or issue['user'].get('login')}
             meta=self.metadata_store.meta('pr_refs:'+str(number)) if self.metadata_store else None
             if not meta:raise UnsupportedPR('PR branch metadata missing; redeliver the PR webhook')
             if meta['base_repo']!=REPO or meta['head_repo']!=REPO or meta['base']!='test':raise UnsupportedPR('unsupported PR target or fork')
@@ -217,6 +227,10 @@ CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head 
             row=c.execute('SELECT pr FROM events ORDER BY pr LIMIT 1').fetchone()
             if row:c.execute('DELETE FROM events WHERE pr=?',(row['pr'],))
             return row['pr'] if row else None
+    def cancel_pr(self,n):
+        with self.db() as c:
+            c.execute("UPDATE jobs SET status='stale',notified=1 WHERE pr=? AND (status IN ('pending','running') OR (status IN ('ready','failed') AND comment_url IS NULL))",(n,))
+            c.execute('DELETE FROM events WHERE pr=?',(n,))
     def enqueue_status(self,n,delay=0):
         with self.db() as c:c.execute('INSERT INTO status_events VALUES (?,?) ON CONFLICT(pr) DO UPDATE SET due=min(due,excluded.due)',(n,time.time()+delay))
     def pop_status(self):
@@ -261,7 +275,8 @@ def render(p,job,result):
     if result.get('model'):lines.append(f'模型：`{result["model"]}` · `{result.get("effort","low")}`')
     if result.get('routing',{}).get('decision')=='escalate':
         lines.append('复杂度升级：'+result['routing']['summary'])
-    if 'error' in result:lines.append('评审引擎未完成，本次没有通过结论。请检查服务日志后重试。')
+    if result.get('error')=='budget_exceeded':lines.append('本轮达到预算上限，已停止继续展开，需人工核查。这不是代码缺陷结论，也不会自动循环重试。')
+    elif 'error' in result:lines.append('评审引擎未完成，本次没有通过结论。请检查服务日志后重试。')
     else:
         for i,x in enumerate(result['issues'],1):
             lines += [f'**F{i} [{x["severity"]}] {x["summary"]}**',f'位置：`{x["file"]}:{x["line"]}`',x['evidence'],'']
@@ -294,6 +309,29 @@ class Worker:
         rows=git(None,'ls-remote',self.cfg['gogs_origin']+'/'+REPO+'.git',*refs)
         by={ref:sha for sha,ref in (x.split() for x in rows.splitlines())}
         return by.get(refs[0]),by.get(refs[1])
+    def wait_for_review(self,number,head,base):
+        deadline=time.monotonic()+min(self.cfg.get('review_timeout',300),300)
+        next_check=time.monotonic()+5
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise subprocess.TimeoutExpired('review',300)
+            try:return self.child.communicate(timeout=min(2,remaining))
+            except subprocess.TimeoutExpired:
+                if self.store.meta('pr_closed:'+str(number),False):
+                    self.kill_child();raise ReviewSuperseded('PR closed or merged')
+                if time.monotonic()>=next_check:
+                    try:
+                        p=self.gogs.page(number)
+                        changed=p['closed'] or self.current_refs(p)!=(head,base)
+                    except UnsupportedPR:
+                        self.kill_child();raise ReviewSuperseded('PR scope changed')
+                    except (requests.RequestException,subprocess.SubprocessError):
+                        next_check=time.monotonic()+5
+                        continue
+                    if changed:
+                        self.kill_child();raise ReviewSuperseded('PR closed, merged or revision replaced')
+                    next_check=time.monotonic()+5
+
     def process(self,n):
         if n==0:
             for number in self.gogs.open_prs():
@@ -302,7 +340,9 @@ class Worker:
         try:p=self.gogs.page(n)
         except UnsupportedPR as e:
             print(f'PR {n} skipped: {e}',flush=True);return
-        if p['closed']:return
+        if p['closed']:
+            self.store.cancel_pr(n);return
+        self.store.set_meta('pr_closed:'+str(n),False)
         head,base=self.refs(p)
         job=self.store.job(n,head,base)
         if job['status']=='stale':
@@ -330,13 +370,15 @@ class Worker:
                 self.child=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                     start_new_session=True,env=engine_env)
                 try:
-                    _,err=self.child.communicate(timeout=self.cfg.get('review_timeout',900))
+                    _,err=self.wait_for_review(n,head,base)
                     result_path.with_suffix('.log').write_text(err)
+                    if self.child.returncode==75:raise ReviewBudgetStopped('stage budget exhausted')
                     if self.child.returncode==0:break
                 except subprocess.TimeoutExpired:
                     self.kill_child()
                     result_path.with_suffix('.log').write_text('review engine timeout')
                 finally:
+                    self.kill_child()
                     self.child=None
                 if attempt+1==max_attempts:raise ValueError('review engine failed; explicit retry required')
                 time.sleep(10)
@@ -357,7 +399,14 @@ class Worker:
                 except Exception:issue['owner_lark_id']=people.get(p.get('author','').casefold())
             result.setdefault('model',engine_env['CODEX_REVIEW_MODEL']);result.setdefault('effort',engine_env['CODEX_REVIEW_EFFORT'])
             self.store.update(job['key'],status='ready',result=json.dumps(result,ensure_ascii=False))
+        except ReviewBudgetStopped:
+            self.store.update(job['key'],status='failed',result=json.dumps({'error':'budget_exceeded'}))
+        except ReviewSuperseded:
+            self.store.update(job['key'],status='stale',notified=1)
+            self.store.enqueue(n)
+            print(f'review {n} cancelled: PR closed or revision replaced',flush=True)
         except Exception as e:
+            self.kill_child()
             print(f'review {n} failed: {type(e).__name__}',flush=True)
             self.store.update(job['key'],status='failed',result=json.dumps({'error':type(e).__name__}))
         finally:
