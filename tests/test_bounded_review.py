@@ -32,6 +32,11 @@ class BudgetTests(unittest.TestCase):
   with self.assertRaises(ReviewBudgetExceeded):collect_bounded(h,0,40000,10)
   h.interrupt.assert_called_once()
 
+ def test_failed_turn_preserves_sdk_reason(self):
+  p={'turn':{'status':'failed','error':{'message':'model temporarily unavailable'}}}
+  h=Mock();h.stream.return_value=(x for x in [SimpleNamespace(method='turn/completed',payload=SimpleNamespace(model_dump=lambda **_:p))])
+  with self.assertRaisesRegex(RuntimeError,'model temporarily unavailable'):collect_bounded(h,0,40000,10)
+
 class CancellationTests(unittest.TestCase):
  def worker(self):
   w=object.__new__(Worker);w.cfg={};w.store=Mock();w.store.meta.return_value=False;w.child=Mock();w.child.communicate.side_effect=subprocess.TimeoutExpired('review',2);w.kill_child=Mock();w.gogs=Mock();w.current_refs=Mock(return_value=('head','base'));return w

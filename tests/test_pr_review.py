@@ -49,7 +49,7 @@ class ReviewTests(unittest.TestCase):
   w.gogs.comment.assert_not_called();send.assert_not_called()
  def test_failed_review_has_no_pass_claim(self):
   _,body=render({},dict(key='k',head='a',base='b'),{'error':'timeout'})
-  self.assertIn('评审失败',body);self.assertNotIn('未发现明确缺陷',body)
+  self.assertIn('评审失败',body);self.assertNotIn('未发现明确缺陷',body);self.assertNotIn('/review-resolve',body);self.assertNotIn('/review-approve',body)
 
  def test_comment_permalink_keeps_pr_path(self):
   c=object.__new__(Gogs);c.origin='https://git.example';c.session=Mock()

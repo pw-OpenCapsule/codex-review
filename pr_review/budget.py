@@ -41,7 +41,11 @@ def collect_bounded(handle,max_tools,max_tokens,seconds,checkpoint=lambda usage:
      elif item.get('phase') is None:fallback=item.get('text')
    if event.method=='turn/completed':completed=p.get('turn')
   if timed_out.is_set():raise ReviewBudgetExceeded('stage time budget exceeded')
-  if not completed or completed.get('status')!='completed' or completed.get('error'):raise RuntimeError('review turn incomplete')
+  if not completed:raise RuntimeError('review turn incomplete: no completion event received')
+  if completed.get('status')!='completed' or completed.get('error'):
+   error=completed.get('error') or {}
+   detail=error.get('message','no error message supplied') if isinstance(error,dict) else str(error)
+   raise RuntimeError(f'review turn {completed.get("status")}: {detail[:1200]}')
   if final is None:final=fallback
   if not final:raise RuntimeError('review response missing')
   return final,usage
