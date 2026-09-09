@@ -11,13 +11,25 @@ def stamp(c):
     except (AttributeError,ValueError):return 0
 
 def evaluate(job,comments,author,reviewers,bot):
-    if not job or job['status']!='ready':return {'allowed':False,'reason':'评审尚未成功完成'}
+    if not job or job['status'] not in ('ready','failed','skipped'):return {'allowed':False,'reason':'评审尚未成功完成'}
     import json
     result=json.loads(job['result'])
-    if 'error' in result:return {'allowed':False,'reason':'评审失败'}
+    manual=job['status'] in ('failed','skipped') or 'error' in result
     match=re.search(r'#issuecomment-(\d+)$',job.get('comment_url') or '')
-    if not match:return {'allowed':False,'reason':'评审评论尚未发布'}
-    review=next((c for c in comments if c['id']==int(match[1])),None)
+    if manual:
+        review=None
+        for c in comments:
+            user=c.get('user',{});name=user.get('username') or user.get('login')
+            if name!=bot:continue
+            m=re.search(r'<!-- pr-review:v1 (.*?) -->',c.get('body',''))
+            if not m:continue
+            try:state=json.loads(m[1])
+            except ValueError:continue
+            if state.get('review_key')==job['key'] and state.get('status') in ('unavailable','skipped'):review=c
+        result={'issues':[]}
+    else:
+        if not match:return {'allowed':False,'reason':'评审评论尚未发布'}
+        review=next((c for c in comments if c['id']==int(match[1])),None)
     if not review:return {'allowed':False,'reason':'无法验证评审评论'}
     if stamp(review)<=0:return {'allowed':False,'reason':'评审时间无法验证'}
     key=job['key'];author=author.casefold();reviewers={x.casefold() for x in reviewers}

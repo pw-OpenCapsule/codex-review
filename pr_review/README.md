@@ -140,3 +140,19 @@ The project cache key covers repository, full head commit, merge-base, and a has
 Successful results and intermediate stages are shared across equivalent jobs. Failed scopes are also remembered, preventing target updates from repeatedly spending on a known failure; explicit `retry PR` clears that failure marker while retaining completed stages. Cache-hit artifacts have empty `usage_by_stage` and preserve historical usage separately as `cached_usage_by_stage`. No new model request is issued on a complete hit.
 
 OpenAI prompt caching is separate from this disk cache and does not imply free repeated reviews. See https://developers.openai.com/api/docs/guides/prompt-caching . We rely on exact local result reuse for zero model calls, rather than sending an entire project repeatedly hoping for model-side cache hits.
+
+## PR Review protocol v1
+
+Only a top-level standalone declaration in the PR body selects the requested level:
+
+```
+[review:none] Nonempty reason
+[review:spark] Nonempty reason
+[review:deep] Nonempty reason
+```
+
+Absent declarations default to Spark. `[no-review] reason` aliases `none`. Quoted, fenced, indented-code and HTML-comment examples are ignored. Multiple declarations, unknown levels and missing reasons produce `invalid`, with no model call. `deep` bypasses Spark and calls GPT-6 low directly; `none` produces `skipped`, never a clean review. A declaration/reason change gets a new confirmation identity; the same effective model configuration can still reuse exact-source results. Running/publishing jobs check declaration freshness.
+
+Spark may ask for up to three bounded source snippets in one additional turn, within the existing 45-second/40k-token stage budget, before choosing its final route. Missing diff text alone is not an escalation reason. Deep remains bounded. Reports show the actual stage model path.
+
+The single editable status includes `<!-- pr-review:v1 {JSON} -->` with `head`, `requested`, `status`, `models`, `cache_hit`, `findings`, and an additive `review_key` for machine-verified acknowledgements. Status values are queued/running/completed/skipped/unavailable/invalid/cancelled. Incomplete states have `findings: null`, not zero. No-review and unavailable states still require manual two-person confirmation. The checker verifies the latest known defect report before allowing a manual fallback; none cannot dismiss findings. The checker remains an optional integration, not a Gogs server-enforced lock.

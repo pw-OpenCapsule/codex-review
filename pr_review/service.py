@@ -10,12 +10,14 @@ from bs4 import BeautifulSoup
 try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
+    from .protocol import declaration,job_key,effective_config
     from .progress import progress_body
     from .reuse import policy_digest,cache_key,stable_remaining
     from .direct_messages import author_recipient,dm_text,delivery_key,send_direct
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
+    from protocol import declaration,job_key,effective_config
     from progress import progress_body
     from reuse import policy_digest,cache_key,stable_remaining
     from direct_messages import author_recipient,dm_text,delivery_key,send_direct
@@ -120,13 +122,13 @@ class Gogs:
             if issue['state']!='open' or issue['pull_request'].get('merged'):
                 return {'number':number,'head':'','base':'','title':f'#{number} '+issue['title'],
                         'url':f'{self.origin}/{REPO}/pulls/{number}','closed':True,
-                        'author':issue['user'].get('username') or issue['user'].get('login')}
+                        'body':issue.get('body',''),'author':issue['user'].get('username') or issue['user'].get('login')}
             meta=self.metadata_store.meta('pr_refs:'+str(number)) if self.metadata_store else None
             if not meta:raise UnsupportedPR('PR branch metadata missing; redeliver the PR webhook')
             if meta['base_repo']!=REPO or meta['head_repo']!=REPO or meta['base']!='test':raise UnsupportedPR('unsupported PR target or fork')
             return {'number':number,'head':meta['head'],'base':meta['base'],'title':f'#{number} '+issue['title'],
                     'url':f'{self.origin}/{REPO}/pulls/{number}','closed':issue['state']!='open',
-                    'author':issue['user'].get('username') or issue['user'].get('login')}
+                    'body':issue.get('body',''),'author':issue['user'].get('username') or issue['user'].get('login')}
         r=self.session.get(f'{self.origin}/{REPO}/pulls/{number}',timeout=30);r.raise_for_status()
         if '/user/login' in r.url:
             if self.credentials_file:raise UnsupportedPR('Private PR HTML needs a supported metadata API')
@@ -243,8 +245,8 @@ CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head 
             row=c.execute('SELECT pr FROM status_events WHERE due<=? ORDER BY due,pr LIMIT 1',(time.time(),)).fetchone()
             if row:c.execute('DELETE FROM status_events WHERE pr=?',(row['pr'],))
             return row['pr'] if row else None
-    def job(self,n,head,base):
-        key=hashlib.sha256(f'{REPO}:{n}:{head}:{base}'.encode()).hexdigest()
+    def job(self,n,head,base,d=None):
+        key=job_key(REPO,n,head,base,d)
         with self.db() as c:
             c.execute('INSERT OR IGNORE INTO jobs(key,pr,head,base,status) VALUES(?,?,?,?,?)',(key,n,head,base,'pending'))
             return dict(c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone())
@@ -280,6 +282,9 @@ def render(p,job,result):
         return marker,body
     status='建议修复后合并' if result['issues'] else '未发现明确缺陷'
     lines=[f'自动评审：{status}',f'范围：`{job["base"][:10]}...{job["head"][:10]}`','']
+    if result.get('usage_by_stage') or result.get('cached_usage_by_stage'):
+        stages=result.get('usage_by_stage') or result.get('cached_usage_by_stage')
+        lines.append('评审路径：'+' → '.join(v.get('model','未知') for v in stages.values())+('（复用缓存）' if result.get('cache',{}).get('hit') else ''))
     if result.get('model'):lines.append(f'模型：`{result["model"]}` · `{result.get("effort","low")}`')
     if result.get('routing',{}).get('decision')=='escalate':
         lines.append('复杂度升级：'+result['routing']['summary'])
@@ -328,7 +333,7 @@ class Worker:
                     try:
                         p=self.gogs.page(number)
                         latest=None if p['closed'] else self.current_refs(p)
-                        changed=p['closed'] or latest[0]!=head
+                        changed=p['closed'] or latest[0]!=head or (hasattr(self,'active_declaration') and declaration(p.get('body',''))!=self.active_declaration)
                         if not changed and latest[1]!=base:
                             git(self.mirror,'fetch','--prune','origin')
                             changed=git(self.mirror,'merge-base',latest[1],head)!=git(self.mirror,'merge-base',base,head)
@@ -353,7 +358,17 @@ class Worker:
             self.store.cancel_pr(n);return
         self.store.set_meta('pr_closed:'+str(n),False)
         head,base=self.refs(p)
-        job=self.store.job(n,head,base)
+        d=declaration(p.get('body',''))
+        job=self.store.job(n,head,base,d)
+        self.store.set_meta('declaration:'+job['key'],d)
+        review_cfg=effective_config(self.cfg,d)
+        if not d['valid'] or d['level']=='none':
+            status='invalid' if not d['valid'] else 'skipped'
+            self.store.update(job['key'],status=status,result=json.dumps({'reason':d['reason']}),notified=1)
+            self.store.enqueue_status(n);return
+        if git(self.mirror,'merge-base',base,head)==head:
+            self.store.update(job['key'],status='skipped',result=json.dumps({'reason':'源码已包含在目标分支'}),notified=1)
+            self.store.enqueue_status(n);return
         if job['status']=='stale':
             self.store.update(job['key'],status='pending',notified=0,comment_url=None)
             job['status']='pending'
@@ -371,7 +386,7 @@ class Worker:
         try:
             if not cwd.exists():git(self.mirror,'worktree','add','--detach',str(cwd),head)
             merge=git(cwd,'merge-base',base,head)
-            shared=Path(self.cfg['state_dir'])/'cache'/cache_key(REPO,head,merge,policy_digest(self.cfg))
+            shared=Path(self.cfg['state_dir'])/'cache'/cache_key(REPO,head,merge,policy_digest(review_cfg))
             shared.mkdir(parents=True,exist_ok=True)
             cached_path=shared/'review.json'
             cache_hit=cached_path.exists()
@@ -383,14 +398,15 @@ class Worker:
             engine_env={k:v for k,v in os.environ.items() if k in
                 {'PATH','HOME','USER','LOGNAME','TMPDIR','LANG','CODEX_HOME','CODEX_REVIEW_MODEL'}}
             if self.cfg.get('codex_bin'):engine_env['CODEX_REVIEW_BIN']=self.cfg['codex_bin']
-            engine_env['CODEX_REVIEW_MODEL']=self.cfg.get('model','gpt-6-astra')
+            engine_env['CODEX_REVIEW_MODEL']=review_cfg['model']
             engine_env['CODEX_REVIEW_EFFORT']=self.cfg.get('effort','low')
-            engine_env['CODEX_REVIEW_ROUTING']=self.cfg.get('routing','fixed')
-            max_attempts=1 if engine_env['CODEX_REVIEW_ROUTING']=='complexity' else 2
+            engine_env['CODEX_REVIEW_ROUTING']=review_cfg['routing']
+            max_attempts=1
             for attempt in range(0 if cache_hit else max_attempts):
                 self.child=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                     start_new_session=True,env=engine_env)
                 try:
+                    self.active_declaration=d
                     _,err=self.wait_for_review(n,head,base)
                     result_path.with_suffix('.log').write_text(err)
                     if self.child.returncode==75:raise ReviewBudgetStopped('stage budget exhausted')
@@ -449,7 +465,7 @@ class Worker:
 
     def publish(self,job):
         p=self.gogs.page(job['pr'])
-        if p['closed'] or self.refs(p)!=(job['head'],job['base']):
+        if p['closed'] or self.refs(p)!=(job['head'],job['base']) or declaration(p.get('body',''))!=self.store.meta('declaration:'+job['key'],declaration('')):
             self.store.update(job['key'],status='stale',notified=1);self.store.enqueue(job['pr']);return
         result=meaningful(json.loads(job['result']))
         if 'error' in result:
@@ -523,9 +539,17 @@ class Worker:
     def check_gate(self,number,head,base):
         p=self.notify_gogs.page(number)
         if p['closed'] or self.current_refs(p)!=(head,base):return {'allowed':False,'reason':'PR 已关闭或版本已变化'}
-        key=hashlib.sha256(f'{REPO}:{number}:{head}:{base}'.encode()).hexdigest()
+        d=declaration(p.get('body',''))
+        key=job_key(REPO,number,head,base,d)
         with self.store.db() as c:r=c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
-        return evaluate_gate(dict(r) if r else None,self.notify_gogs.comments(number),p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
+        comments=self.notify_gogs.comments(number)
+        if r and r['status'] in ('failed','skipped'):
+            # Switching to none/unavailable does not erase the last known defects.
+            with self.store.db() as c:prior=c.execute("SELECT * FROM jobs WHERE pr=? AND status='ready' AND comment_url IS NOT NULL ORDER BY rowid DESC LIMIT 1",(number,)).fetchone()
+            if prior and json.loads(prior['result']).get('issues'):
+                old=evaluate_gate(dict(prior),comments,p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
+                if not old['allowed']:return {'allowed':False,'reason':'已有评审缺陷尚未完成处理与双人确认'}
+        return evaluate_gate(dict(r) if r else None,comments,p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
 
     def sync_status(self,number):
         if number==0:
@@ -536,9 +560,14 @@ class Worker:
             self.status_gogs.status_comment(number,progress_body(None,closed=True));return
         head,base=self.current_refs(p)
         if not head or not base:return
-        key=hashlib.sha256(f'{REPO}:{number}:{head}:{base}'.encode()).hexdigest()
+        d=declaration(p.get('body',''))
+        key=job_key(REPO,number,head,base,d)
         with self.store.db() as c:row=c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
-        body=progress_body(dict(row) if row else None,head,base)
+        job=dict(row) if row else {'status':'pending'}
+        job['declaration']=d
+        if not d['valid']:job.update(status='invalid',result=json.dumps({'reason':d['reason']}))
+        elif d['level']=='none':job.update(status='skipped',result=json.dumps({'reason':d['reason']}))
+        body=progress_body(job,head,base)
         # Worker threads change status independently. Read the latest state on each queued event.
         self.status_gogs.status_comment(number,body)
 
