@@ -15,7 +15,8 @@ class ProgressTests(unittest.TestCase):
  def test_ready_without_published_report_does_not_claim_done(self):
   self.assertIn('正在发布',progress_body({'status':'ready','result':'{"issues":[]}'},'a','b'))
  def test_failed_review_blocks_recommendation(self):
-  self.assertIn('未完成',progress_body({'status':'failed'},'a','b'))
+  body=progress_body({'status':'failed'},'a','b')
+  self.assertIn('未完成',body);self.assertIn('双人人工确认',body);self.assertNotIn('暂缓合并',body)
  def test_same_comment_is_edited_and_unchanged_body_is_not_reposted(self):
   g=object.__new__(Gogs);g.username='robot';g.origin='https://git';g.session=Mock()
   with patch('pr_review.service.REPO','games/aeroplane'):
@@ -36,6 +37,12 @@ class ProgressTests(unittest.TestCase):
    with patch('pr_review.service.send_lark') as group,patch('pr_review.service.send_direct') as dm:
     w.sync_status(40);group.assert_not_called();dm.assert_not_called()
    body=w.status_gogs.status_comment.call_args.args[1];self.assertIn('已排队',body);self.assertIn('new',body);self.assertNotIn('old-link',body)
+ def test_service_failure_only_updates_status_without_defect_comment(self):
+  with tempfile.TemporaryDirectory() as d:
+   w=object.__new__(Worker);w.store=Store(Path(d)/'state');w.gogs=Mock();w.gogs.page.return_value={'closed':False};w.refs=lambda p:('h','b')
+   j=w.store.job(89,'h','b');w.store.update(j['key'],status='failed',result='{"error":"quota"}');j=w.store.job(89,'h','b')
+   w.publish(j);w.gogs.comment.assert_not_called()
+   self.assertEqual(w.store.job(89,'h','b')['notified'],1);self.assertEqual(w.store.pop_status(),89)
  def test_status_queue_is_independent_and_coalesces_events(self):
   with tempfile.TemporaryDirectory() as d:
    s=Store(Path(d)/'state');s.enqueue(1);s.enqueue_status(2);s.enqueue_status(2)
