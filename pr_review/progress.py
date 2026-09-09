@@ -10,10 +10,10 @@ def progress_body(job,head=None,base=None,closed=False):
     elif state=='running':
         title='🔎 自动评审中，请暂缓合并。'
     elif state=='failed':
-        title='❌ 自动评审未完成，请暂缓合并并查看失败说明。'
+        title='⚪ 自动评审未完成（服务不可用），请走双人人工确认；服务故障或额度不足不阻止人工合并。已有缺陷仍需处理或说明误报。'
     else:
         result=json.loads(job.get('result') or '{}')
-        if 'error' in result:title='❌ 自动评审未完成，请暂缓合并。'
+        if 'error' in result:title='⚪ 自动评审未完成（服务不可用），请走双人人工确认；已有缺陷仍需处理或说明误报。'
         elif not job.get('comment_url'):title='🔎 评审结果正在发布，请暂缓合并。'
         elif result.get('issues'):title=f'⚠️ 自动评审发现 {len(result["issues"])} 个待处理问题，请处理并完成双人确认后再合并。'
         else:title='✅ 自动评审完成，未发现明确缺陷；仍需人工检查与双人确认。'

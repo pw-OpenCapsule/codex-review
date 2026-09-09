@@ -451,7 +451,14 @@ class Worker:
         p=self.gogs.page(job['pr'])
         if p['closed'] or self.refs(p)!=(job['head'],job['base']):
             self.store.update(job['key'],status='stale',notified=1);self.store.enqueue(job['pr']);return
-        result=meaningful(json.loads(job['result']));marker,body=render(p,job,result)
+        result=meaningful(json.loads(job['result']))
+        if 'error' in result:
+            # Service failures belong in the single editable status, not repeated
+            # defect comments or author notifications on every target-tip update.
+            self.store.update(job['key'],notified=1)
+            self.store.enqueue_status(job['pr'])
+            return
+        marker,body=render(p,job,result)
         url=job['comment_url']
         if not url:
             url=self.gogs.comment(job['pr'],marker,body)
