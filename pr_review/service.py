@@ -363,6 +363,7 @@ class Worker:
                 '--base',merge,'--head',head,'--output',str(result_path)]
             engine_env={k:v for k,v in os.environ.items() if k in
                 {'PATH','HOME','USER','LOGNAME','TMPDIR','LANG','CODEX_HOME','CODEX_REVIEW_MODEL'}}
+            if self.cfg.get('codex_bin'):engine_env['CODEX_REVIEW_BIN']=self.cfg['codex_bin']
             engine_env['CODEX_REVIEW_MODEL']=self.cfg.get('model','gpt-6-astra')
             engine_env['CODEX_REVIEW_EFFORT']=self.cfg.get('effort','low')
             engine_env['CODEX_REVIEW_ROUTING']=self.cfg.get('routing','fixed')

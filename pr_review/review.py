@@ -1,9 +1,11 @@
 """Bounded SDK child. Uses the explicitly selected local CLI, never an implicit old model."""
-import argparse,json,os,shutil,subprocess,tomllib,sys
+import argparse,json,os,shutil,subprocess,tomllib,sys,time
 from pathlib import Path
 from openai_codex import Codex,CodexConfig,Sandbox,ApprovalMode
 from routing import pipeline,atomic_json,SPARK
 from budget import collect_bounded,ReviewBudgetExceeded
+from model_profile import context_limits,startup_overrides
+from focused import focused_schema,focused_review,read_context
 
 SCHEMA={'type':'object','properties':{'issues':{'type':'array','items':{'type':'object','properties':{
  'severity':{'type':'string','enum':['P0','P1','P2']},'summary':{'type':'string'},'file':{'type':'string','description':'仓库相对路径，不是绝对路径'},
@@ -31,19 +33,33 @@ def main():
  home=Path(os.environ.get('CODEX_HOME',str(Path.home()/'.codex')))
  conf={}
  if (home/'config.toml').exists():conf=tomllib.loads((home/'config.toml').read_text())
- cfg={'features':{'multi_agent':False,'shell_snapshot':False},'mcp_servers':{k:{'enabled':False} for k in conf.get('mcp_servers',{})},'web_search':'disabled','model_reasoning_effort':os.environ.get('CODEX_REVIEW_EFFORT','low')}
+ cfg={'features':{'multi_agent':False,'shell_snapshot':False,'hooks':False,'child_agents_md':False},'mcp_servers':{k:{'enabled':False} for k in conf.get('mcp_servers',{})},'web_search':'disabled','model_reasoning_effort':os.environ.get('CODEX_REVIEW_EFFORT','low')}
  def run(model,instructions,schema):
-  stage_cfg={**cfg,'features':{**cfg['features'],'shell_tool':model!=SPARK,'unified_exec':model!=SPARK}}
-  with Codex(config=CodexConfig(codex_bin=shutil.which('codex'),cwd=str(cwd))) as codex:
+  stage_cfg={**cfg,**context_limits(model),'features':{**cfg['features'],'shell_tool':False,'unified_exec':False}}
+  with Codex(config=CodexConfig(codex_bin=os.environ.get('CODEX_REVIEW_BIN') or shutil.which('codex'),cwd=str(cwd),config_overrides=startup_overrides(model))) as codex:
    thread=codex.thread_start(cwd=str(cwd),sandbox=Sandbox.read_only,approval_mode=ApprovalMode.deny_all,
-        base_instructions=('你是只分析输入文本的代码差异分类器，不使用任何工具。不要计划检索或尝试执行命令。信息不足时给出具体升级证据，禁止自行展开。' if model==SPARK else None),
+        base_instructions=('你是只分析输入文本的代码差异分类器，不使用任何工具。不要计划检索或尝试执行命令。信息不足时给出具体升级证据，禁止自行展开。' if model==SPARK else '你是有限上下文的代码审查员，不直接调用工具。需要补充代码时，用结构化 requests 申请具体文件的行范围；禁止扫描全仓库。'),
         developer_instructions=(RULES+'\n本轮 Spark 只审查提供的片段；不要自行查运行手册或代码。工具已关闭，禁止尝试调用。' if model==SPARK else RULES),ephemeral=True,config=stage_cfg,model=model,service_tier='default')
-   handle=thread.turn(prompt+'\n'+instructions,output_schema=schema,effort='low')
-   def record_usage(usage):
-    atomic_json(str(a.output)+'.'+('spark' if model==SPARK else 'deep')+'.usage.json',{'model':model,'usage':usage})
-   raw,usage=collect_bounded(handle,max_tools=0 if model==SPARK else 8,
-       max_tokens=40000 if model==SPARK else 250000,seconds=45 if model==SPARK else 180,checkpoint=record_usage)
-   parsed=json.loads(raw)
+   deadline=time.monotonic()+(45 if model==SPARK else 180)
+   def turn(text,turn_schema):
+    remaining=deadline-time.monotonic()
+    if remaining<=0:raise ReviewBudgetExceeded('stage time budget exceeded')
+    handle=thread.turn(text,output_schema=turn_schema,effort='low')
+    def record_usage(usage):
+     atomic_json(str(a.output)+'.'+('spark' if model==SPARK else 'deep')+'.usage.json',{'model':model,'usage':usage})
+    raw,usage=collect_bounded(handle,max_tools=0,max_tokens=40000 if model==SPARK else 250000,
+        seconds=remaining,checkpoint=record_usage)
+    return json.loads(raw),usage
+   if model==SPARK:
+    parsed,usage=turn(prompt+'\n'+instructions,schema)
+   else:
+    first=True
+    def deep_turn(extra):
+     nonlocal first
+     text=(prompt+'\n'+instructions+'\n可请求最多8个代码片段，每次最多3个，每片段最多160行。总共最多4轮回答。先围绕具体疑点申请所需片段，禁止要求整文件或整仓库。能确认的缺陷写 issues；证据不足明确 insufficient_context，不能冒充通过。' if first else extra)
+     first=False
+     return turn(text,focused_schema(schema))
+    parsed,usage=focused_review(deep_turn,lambda req:read_context(cwd,req))
    for e in parsed.get('issues',[])+parsed.get('evidence',[]):
     file=Path(e['file'])
     resolved=(cwd/file).resolve()
