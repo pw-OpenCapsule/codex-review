@@ -270,17 +270,18 @@ def validate_review(value):
 
 def render(p,job,result):
     marker='review-id:'+job['key']+(':failed' if 'error' in result else ':complete')
-    status='达到预算上限，待人工核查' if result.get('error')=='budget_exceeded' else ('评审失败，需要重试' if 'error' in result else ('建议修复后合并' if result['issues'] else '未发现明确缺陷'))
+    if 'error' in result:
+        title='本轮达到预算上限，待人工核查' if result['error']=='budget_exceeded' else '自动评审失败：服务未形成代码结论'
+        body=f'{title}\n\n范围：`{job["base"][:10]}...{job["head"][:10]}`\n\n这不是代码缺陷报告，无需填写 F1 fixed。由维护者检查服务日志，必要时人工核查；不会自动循环重试。\n\n自动评审标识 `{marker}`'
+        return marker,body
+    status='建议修复后合并' if result['issues'] else '未发现明确缺陷'
     lines=[f'自动评审：{status}',f'范围：`{job["base"][:10]}...{job["head"][:10]}`','']
     if result.get('model'):lines.append(f'模型：`{result["model"]}` · `{result.get("effort","low")}`')
     if result.get('routing',{}).get('decision')=='escalate':
         lines.append('复杂度升级：'+result['routing']['summary'])
-    if result.get('error')=='budget_exceeded':lines.append('本轮达到预算上限，已停止继续展开，需人工核查。这不是代码缺陷结论，也不会自动循环重试。')
-    elif 'error' in result:lines.append('评审引擎未完成，本次没有通过结论。请检查服务日志后重试。')
-    else:
-        for i,x in enumerate(result['issues'],1):
-            lines += [f'**F{i} [{x["severity"]}] {x["summary"]}**',f'位置：`{x["file"]}:{x["line"]}`',x['evidence'],'']
-        lines += ['验证范围：只读代码评审；未执行仓库脚本、线上验收或部署。']
+    for i,x in enumerate(result['issues'],1):
+        lines += [f'**F{i} [{x["severity"]}] {x["summary"]}**',f'位置：`{x["file"]}:{x["line"]}`',x['evidence'],'']
+    lines += ['验证范围：只读代码评审；未执行仓库脚本、线上验收或部署。']
     lines += ['','合并前需双人确认，AI 意见允许有依据地判为误报。新提交或目标分支变化使旧确认失效。',
         f'作者回复：`/review-resolve {job["key"]}`，下一行起逐条写 `F1 fixed 原因` 或 `F1 false-positive 依据`（0 问题只需首行）。',
         f'另一位维护者在作者处理后回复：`/review-approve {job["key"]} 已核对的具体依据`。',
