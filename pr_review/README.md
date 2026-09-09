@@ -30,6 +30,7 @@ Put this JSON outside the checkout, chmod 600, in a private state directory (chm
 ```json
 {
   "repo": "example/project",
+  "routing": "complexity",
   "model": "gpt-6-astra",
   "effort": "low",
   "gogs_credentials_file": "/private/gogs-credentials.json",
@@ -101,3 +102,13 @@ Author self-approval, bot approval, unknown maintainers, missing findings, appro
 `POST /merge-gate/check` accepts `{repo, pr, head, base}` and an HMAC SHA256 in X-Gogs-Signature using the separate gate_secret. It queries current refs and authenticated comments before returning allowed/reason. Failures deny eligibility. This is a verification endpoint, **not an enforcement boundary by itself**.
 
 This Gogs instance has no required-status-check setting and its Git hook management is unavailable. Until the server invokes this checker atomically at merge time, or permissions are redesigned so only an enforcing integration can merge, ordinary Gogs merges can bypass these acknowledgements. Do not claim the merge button is locked. Repository-administrator permissions and deployment boundaries remain outside this service.
+
+## Complexity routing
+
+Set `routing: "complexity"` in the private config. Every new review starts with `gpt-5.3-codex-spark / low`. Spark completes clear local reviews itself. It requests `gpt-6-astra / low` only with concrete file/line/scenario evidence for interleaved state paths, coupled cross-module constraints, or unresolved verification. Business names, payment-related filenames, severity alone, and mechanically touching many files are not routing rules.
+
+The deep stage gets Spark's context summary and candidates, verifies them independently and produces the only final findings. Spark candidates are never published as confirmed deep-review findings. Complexity, reasons, selected model and per-stage measured token usage are stored with the artifact; absent SDK usage stays null rather than zero.
+
+Automatic execution is bounded to one Spark stage and, if needed, one GPT-6 stage. Completed stages are atomically checkpointed in `results/JOB.json.stages.json`; explicit retry after a deep-stage failure reuses Spark. A different revision invalidates the checkpoint. Increment `routing.VERSION` when changing the triage contract. Failed or evidence-free classification is a review failure, never a clean pass or an automatic expensive fallback.
+
+The notification policy is unchanged: only private bot messages to the PR author, no group fallback, zero findings and unchanged findings remain quiet.

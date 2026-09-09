@@ -237,6 +237,8 @@ def render(p,job,result):
     status='评审失败，需要重试' if 'error' in result else ('建议修复后合并' if result['issues'] else '未发现明确缺陷')
     lines=[f'自动评审：{status}',f'范围：`{job["base"][:10]}...{job["head"][:10]}`','']
     if result.get('model'):lines.append(f'模型：`{result["model"]}` · `{result.get("effort","low")}`')
+    if result.get('routing',{}).get('decision')=='escalate':
+        lines.append('复杂度升级：'+result['routing']['summary'])
     if 'error' in result:lines.append('评审引擎未完成，本次没有通过结论。请检查服务日志后重试。')
     else:
         for i,x in enumerate(result['issues'],1):
@@ -297,7 +299,9 @@ class Worker:
                 {'PATH','HOME','USER','LOGNAME','TMPDIR','LANG','CODEX_HOME','CODEX_REVIEW_MODEL'}}
             engine_env['CODEX_REVIEW_MODEL']=self.cfg.get('model','gpt-6-astra')
             engine_env['CODEX_REVIEW_EFFORT']=self.cfg.get('effort','low')
-            for attempt in range(2):
+            engine_env['CODEX_REVIEW_ROUTING']=self.cfg.get('routing','fixed')
+            max_attempts=1 if engine_env['CODEX_REVIEW_ROUTING']=='complexity' else 2
+            for attempt in range(max_attempts):
                 self.child=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
                     start_new_session=True,env=engine_env)
                 try:
@@ -309,7 +313,7 @@ class Worker:
                     result_path.with_suffix('.log').write_text('review engine timeout')
                 finally:
                     self.child=None
-                if attempt==1:raise ValueError('review engine failed after retry')
+                if attempt+1==max_attempts:raise ValueError('review engine failed; explicit retry required')
                 time.sleep(10)
             result=meaningful(validate_review(json.loads(result_path.read_text())))
             people=read_people(self.cfg.get('lark_user_map',''))
@@ -326,7 +330,7 @@ class Worker:
                     name=re.search(r'^author (.+)$',blame,re.M)
                     issue['owner_lark_id']=next((people.get(x.casefold()) for x in [email[1] if email else '',name[1] if name else '',p.get('author','')] if people.get(x.casefold())),None)
                 except Exception:issue['owner_lark_id']=people.get(p.get('author','').casefold())
-            result['model']=engine_env['CODEX_REVIEW_MODEL'];result['effort']=engine_env['CODEX_REVIEW_EFFORT']
+            result.setdefault('model',engine_env['CODEX_REVIEW_MODEL']);result.setdefault('effort',engine_env['CODEX_REVIEW_EFFORT'])
             self.store.update(job['key'],status='ready',result=json.dumps(result,ensure_ascii=False))
         except Exception as e:
             print(f'review {n} failed: {type(e).__name__}',flush=True)
@@ -475,6 +479,7 @@ def main():
         raise SystemExit('usage: service.py CONFIG [retry PR_NUMBER]')
     global REPO
     config=json.loads(Path(sys.argv[1]).read_text())
+    if config.get('routing','fixed') not in ('fixed','complexity'):raise SystemExit('invalid review routing mode')
     REPO=config['repo']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',REPO):raise SystemExit('invalid repository')
     if not config.get('webhook_secret'):raise SystemExit('webhook secret required')
