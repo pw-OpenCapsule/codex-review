@@ -2,7 +2,7 @@
 
 ## PR 自动评审（事件驱动）
 
-新增独立服务见 [pr_review/README.md](pr_review/README.md)：Gogs Webhook → 隔离只读评审 → robot 账号评论 → 按已有映射私信 PR 作者（不发群）。默认 gpt-6-astra / low；0 问题和低价值建议不通知，P0/P1 立即提醒，P2 最多汇总 30 秒，重复问题不刷群。
+新增独立服务见 [pr_review/README.md](pr_review/README.md)：Gogs Webhook → 隔离只读评审 → robot 账号评论 → 按已有映射私信 PR 作者（不发群）。默认 Spark / low 按改动复杂度初筛，必要时升级 GPT-6 / low（不按业务类型分流）；0 问题和低价值建议不通知，P0/P1 立即提醒，P2 最多汇总 30 秒，重复问题不刷群。
 
 包含绑定评审版本的双人确认校验器。当前 Gogs 尚未接入服务端强制合并检查，不能把校验器或评论规则当作已经锁住合并按钮。原有每日/每周审计脚本继续独立运行。
 
