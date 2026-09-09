@@ -10,10 +10,12 @@ from bs4 import BeautifulSoup
 try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
+    from .progress import progress_body
     from .direct_messages import author_recipient,dm_text,delivery_key,send_direct
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
+    from progress import progress_body
     from direct_messages import author_recipient,dm_text,delivery_key,send_direct
 
 REPO = os.environ.get('PR_REVIEW_REPO', 'example/project')
@@ -147,6 +149,17 @@ class Gogs:
             result.extend(fresh)
             if len(rows)<50:break
         return result
+    def status_comment(self,number,body):
+        marker=f'<!-- pr-review-status:{REPO}:{number} -->'
+        content=body+'\n\n'+marker
+        for x in self.comments(number):
+            user=x.get('user',{});author=user.get('username') or user.get('login')
+            if marker in x.get('body','') and author==self.username:
+                if x['body']!=content:
+                    r=self.session.patch(f'{self.origin}/api/v1/repos/{REPO}/issues/comments/{x["id"]}',json={'body':content},timeout=30);r.raise_for_status()
+                return f'{self.origin}/{REPO}/pulls/{number}#issuecomment-{x["id"]}'
+        if self.page(number)['closed']:return None
+        return self.comment(number,marker,content)
     def comment(self, number, marker, body):
         if getattr(self,'credentials_file',None):
             for x in self.comments(number):
@@ -184,7 +197,8 @@ class Store:
     def __init__(self,path):
         self.path=str(path)
         with self.db() as c:
-            c.executescript('''CREATE TABLE IF NOT EXISTS notice_meta(name TEXT PRIMARY KEY,value TEXT);
+            c.executescript('''CREATE TABLE IF NOT EXISTS status_events(pr INTEGER PRIMARY KEY,due REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS notice_meta(name TEXT PRIMARY KEY,value TEXT);
 CREATE TABLE IF NOT EXISTS events(pr INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
  status TEXT NOT NULL, result TEXT, comment_url TEXT, notified INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, retry_at REAL DEFAULT 0);
@@ -202,6 +216,14 @@ CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, pr INTEGER NOT NULL, head 
             c.execute('BEGIN IMMEDIATE')
             row=c.execute('SELECT pr FROM events ORDER BY pr LIMIT 1').fetchone()
             if row:c.execute('DELETE FROM events WHERE pr=?',(row['pr'],))
+            return row['pr'] if row else None
+    def enqueue_status(self,n,delay=0):
+        with self.db() as c:c.execute('INSERT INTO status_events VALUES (?,?) ON CONFLICT(pr) DO UPDATE SET due=min(due,excluded.due)',(n,time.time()+delay))
+    def pop_status(self):
+        with self.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row=c.execute('SELECT pr FROM status_events WHERE due<=? ORDER BY due,pr LIMIT 1',(time.time(),)).fetchone()
+            if row:c.execute('DELETE FROM status_events WHERE pr=?',(row['pr'],))
             return row['pr'] if row else None
     def job(self,n,head,base):
         key=hashlib.sha256(f'{REPO}:{n}:{head}:{base}'.encode()).hexdigest()
@@ -261,6 +283,7 @@ class Worker:
     def __init__(self,config,store):
         self.cfg=config;self.store=store;self.gogs=Gogs(config['gogs_origin'],config.get('gogs_credentials_file'),store);self.child=None
         self.notify_gogs=Gogs(config['gogs_origin'],config.get('gogs_credentials_file'),store)
+        self.status_gogs=Gogs(config['gogs_origin'],config.get('gogs_credentials_file'),store)
         self.mirror=Path(config['state_dir'])/'mirror.git'
         if not self.mirror.exists():git(None,'clone','--mirror',config['gogs_origin']+'/'+REPO+'.git',str(self.mirror))
     def refs(self,p):
@@ -273,7 +296,8 @@ class Worker:
         return by.get(refs[0]),by.get(refs[1])
     def process(self,n):
         if n==0:
-            for number in self.gogs.open_prs():self.store.enqueue(number)
+            for number in self.gogs.open_prs():
+                self.store.enqueue(number);self.store.enqueue_status(number)
             return
         try:p=self.gogs.page(n)
         except UnsupportedPR as e:
@@ -286,6 +310,7 @@ class Worker:
             job['status']='pending'
         if job['status'] not in ['pending','running']:return
         self.store.update(job['key'],status='running')
+        self.store.enqueue_status(n)
         cwd=Path(self.cfg['state_dir'])/'work'/job['key']
         result_path=Path(self.cfg['state_dir'])/'results'/f'{job["key"]}.json'
         cwd.parent.mkdir(exist_ok=True);result_path.parent.mkdir(exist_ok=True)
@@ -336,6 +361,7 @@ class Worker:
             print(f'review {n} failed: {type(e).__name__}',flush=True)
             self.store.update(job['key'],status='failed',result=json.dumps({'error':type(e).__name__}))
         finally:
+            self.store.enqueue_status(n)
             if cwd.exists():git(self.mirror,'worktree','remove','--force',str(cwd))
     def kill_child(self):
         if self.child and self.child.poll() is None:
@@ -352,6 +378,7 @@ class Worker:
         if not url:
             url=self.gogs.comment(job['pr'],marker,body)
             self.store.update(job['key'],comment_url=url)
+            self.store.enqueue_status(job['pr'])
         if 'error' not in result and not result['issues']:
             self.store.set_meta('sent:'+str(job['pr']),[])
             self.store.update(job['key'],notified=1)
@@ -415,6 +442,32 @@ class Worker:
         with self.store.db() as c:r=c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
         return evaluate_gate(dict(r) if r else None,self.notify_gogs.comments(number),p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
 
+    def sync_status(self,number):
+        if number==0:
+            for n in self.status_gogs.open_prs():self.store.enqueue_status(n)
+            return
+        p=self.status_gogs.page(number)
+        if p['closed']:
+            self.status_gogs.status_comment(number,progress_body(None,closed=True));return
+        head,base=self.current_refs(p)
+        if not head or not base:return
+        key=hashlib.sha256(f'{REPO}:{number}:{head}:{base}'.encode()).hexdigest()
+        with self.store.db() as c:row=c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
+        body=progress_body(dict(row) if row else None,head,base)
+        # Worker threads change status independently. Read the latest state on each queued event.
+        self.status_gogs.status_comment(number,body)
+
+    def status_loop(self):
+        while True:
+            n=self.store.pop_status()
+            if n is not None:
+                try:self.sync_status(n)
+                except UnsupportedPR:pass
+                except Exception as e:
+                    print(f'PR {n} status deferred: {type(e).__name__}',flush=True)
+                    self.store.enqueue_status(n,30)
+            time.sleep(.5)
+
     def notification_loop(self):
         while True:
             try:self.notify_batch()
@@ -469,7 +522,11 @@ def server(config,store,gate_checker=None):
                 save_pr_metadata(payload,store)
                 pr=event_pr(self.headers.get('X-Gogs-Event',''),payload)
             except (ValueError,AttributeError,TypeError):self.send_error(400);return
-            if pr is not None:store.enqueue(pr)
+            if pr is not None:
+                store.enqueue(pr);store.enqueue_status(pr)
+            elif payload.get('repository',{}).get('full_name')==REPO and isinstance(payload.get('pull_request'),dict):
+                number=payload['pull_request'].get('number')
+                if type(number) is int and number>0:store.enqueue_status(number)
             self.send_response(202);self.end_headers();self.wfile.write(b'queued' if pr is not None else b'ignored')
         def log_message(self,format,*args):pass
     return ThreadingHTTPServer((config.get('bind','127.0.0.1'),config.get('port',9847)),Handler)
@@ -503,6 +560,7 @@ def main():
     worker=Worker(config,store)
     threading.Thread(target=worker.loop,daemon=True).start()
     threading.Thread(target=worker.notification_loop,daemon=True).start()
+    threading.Thread(target=worker.status_loop,daemon=True).start()
     def terminate(*_):
         worker.kill_child()
         raise SystemExit(0)
