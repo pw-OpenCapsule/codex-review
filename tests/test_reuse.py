@@ -1,6 +1,7 @@
 import json,sqlite3,tempfile,unittest
 from pathlib import Path
 from unittest.mock import Mock,patch
+from pr_review.protocol import effective_config,declaration
 from pr_review.reuse import cache_key,policy_digest,stable_remaining
 from pr_review.service import Store,Worker
 
@@ -28,7 +29,7 @@ class ReuseTests(unittest.TestCase):
    w.gogs=Mock();w.gogs.page.return_value={'closed':False,'author':'a'};w.refs=Mock(return_value=('head','target2'))
    w.mirror=Path(d)/'mirror';w.kill_child=Mock()
    from pr_review.service import REPO
-   key=cache_key(REPO,'head','merge',policy_digest(w.cfg));p=Path(d)/'cache'/key;p.mkdir(parents=True)
+   key=cache_key(REPO,'head','merge',policy_digest(effective_config(w.cfg,declaration(""))));p=Path(d)/'cache'/key;p.mkdir(parents=True)
    (p/'review.json').write_text(json.dumps({'issues':[],'model':'gpt-5.3-codex-spark','usage_by_stage':{'spark':{'usage':123}}}))
    with patch('pr_review.service.git',return_value='merge'),patch('pr_review.service.subprocess.Popen') as model:
     w.process(9)
@@ -41,6 +42,6 @@ class ReuseTests(unittest.TestCase):
    w=object.__new__(Worker);w.cfg={'state_dir':d,'settle_seconds':0};w.store=Store(Path(d)/'state');w.child=None
    w.gogs=Mock();w.gogs.page.return_value={'closed':False};w.refs=Mock(return_value=('head','newtarget'));w.mirror=Path(d)/'mirror';w.kill_child=Mock()
    from pr_review.service import REPO
-   key=cache_key(REPO,'head','merge',policy_digest(w.cfg));p=Path(d)/'cache'/key;p.mkdir(parents=True);(p/'failure.json').write_text('{}')
+   key=cache_key(REPO,'head','merge',policy_digest(effective_config(w.cfg,declaration(""))));p=Path(d)/'cache'/key;p.mkdir(parents=True);(p/'failure.json').write_text('{}')
    with patch('pr_review.service.git',return_value='merge'),patch('pr_review.service.subprocess.Popen') as model:w.process(9)
    model.assert_not_called();self.assertEqual(w.store.job(9,'head','newtarget')['status'],'failed')
