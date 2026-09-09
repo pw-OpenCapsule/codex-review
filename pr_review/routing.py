@@ -4,7 +4,7 @@ from pathlib import Path
 
 SPARK='gpt-5.3-codex-spark'
 DEEP='gpt-6-astra'
-VERSION=2
+VERSION=3
 
 TRIAGE_RULES='''本轮使用 Spark 同时做复杂度判断和可完成的局部评审。按本次改动所需推理判断，不按业务名称、文件名或问题严重级别分流。
 资金/权限模块的简单字段映射可以 complete；普通页面的异步竞态可能 escalate。

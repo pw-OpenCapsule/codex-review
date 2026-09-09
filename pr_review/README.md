@@ -31,6 +31,7 @@ Put this JSON outside the checkout, chmod 600, in a private state directory (chm
 {
   "repo": "example/project",
   "routing": "complexity",
+  "codex_bin": "/opt/homebrew/bin/codex",
   "model": "gpt-6-astra",
   "effort": "low",
   "gogs_credentials_file": "/private/gogs-credentials.json",
@@ -119,6 +120,12 @@ A separate persistent status queue updates one robot-owned comment per PR withou
 
 ## Cost bounds and cancellation
 
-Both stages explicitly select the default service tier (not Fast). Spark receives the bounded patch with shell, unified exec, web and subagent access disabled: 0 tool operations, 40,000 cumulative context-work tokens, 45 seconds. Deep review permits up to 8 tool operations, 250,000 cumulative context-work tokens and 180 seconds. Token caps include cached input and are workload caps, not a conversion to billable credits. Usage notifications are checkpointed while running, including interrupted work. Exceeding a limit is incomplete review, never a clean pass.
+Both stages explicitly select the default service tier (not Fast). Spark receives the bounded patch with shell, unified exec, web and subagent access disabled: 0 tool operations, 40,000 cumulative context-work tokens, 45 seconds. Deep review has no native tool access. It may request up to 8 program-provided tracked-file snippets (160 lines / 10,000 characters each), across at most 4 model responses, with 250,000 cumulative context-work tokens and 180 seconds. Token caps include cached input and are workload caps, not a conversion to billable credits. Usage notifications are checkpointed while running, including interrupted work. Exceeding a limit is incomplete review, never a clean pass.
 
 A closed/merged PR webhook cancels queued jobs. The worker checks this cancellation flag every 2 seconds while waiting for its child; it also checks the authoritative PR state and both Git refs every 5 seconds (subject to network latency). Closed, merged or replaced revisions terminate the SDK process group and become stale without a failure notification. Before publishing, the existing freshness check remains in place. There is also a 300-second parent watchdog.
+
+## Isolated runtime profile
+
+Set `codex_bin` to the real CLI executable (this deployment uses `/opt/homebrew/bin/codex`), not an interactive statebar/agent wrapper. Each SDK app-server starts with service-owned model context and compaction limits, and the same limits are passed to the thread. Spark: 128,000 context / 80,000 auto-compaction; deep: 256,000 / 180,000. These caps do not alter the user's personal config. Personal hooks, child-agent instructions and automatic project-doc injection are disabled at startup; reviewers read only the task-supplied scope and permitted relevant files.
+
+This prevents a personal million-token context override and interactive runtime hooks from contaminating Spark review requests. Regression verification must include a real PR invocation, not only a tiny model smoke test.
