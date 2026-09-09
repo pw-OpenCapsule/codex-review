@@ -35,6 +35,8 @@ Put this JSON outside the checkout, chmod 600, in a private state directory (chm
   "gogs_credentials_file": "/private/gogs-credentials.json",
   "lark_user_map": "/private/lark_user_map.tsv",
   "digest_delay_seconds": 30,
+  "notification_mode": "direct",
+  "lark_cli": "/usr/local/bin/lark-cli",
   "reviewers": ["maintainer-a", "maintainer-b"],
   "gate_secret": "GENERATE-A-DIFFERENT-RANDOM-SECRET",
   "gogs_origin": "https://git.example.com",
@@ -67,6 +69,12 @@ python -m unittest discover -s tests -p test_pr_review.py -v
 ```
 
 Test the Gogs delivery after service/Tunnel startup. Confirm 202 delivery, a single review per source/target revision, the PR comment permalink and Lark notification. Never run production acceptance scripts as an automatic check.
+
+## Private notifications (production default)
+
+Set `notification_mode` to `direct` and `lark_cli` to the absolute, authenticated lark-cli executable path. The existing trusted mapping resolves the **PR author**, not each blame author, to one open_id. The app bot sends a concise plain-text DM with issue summaries, priorities and the PR comment link. It never sends on behalf of the logged-in human.
+
+Zero findings and unchanged findings remain quiet. Each delivery has a stable API idempotency key plus a durable message receipt. Partial failures retry per PR without re-sending successful messages or blocking other recipients. Missing mappings or inaccessible users stay pending; **there is no group fallback**. The app must have bot messaging permission and be available to each recipient. Existing group webhook configuration may be retained but is not used in direct mode.
 
 ## Robot credential file
 
