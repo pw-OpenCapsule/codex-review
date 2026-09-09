@@ -270,7 +270,7 @@ def validate_review(value):
 
 def render(p,job,result):
     marker='review-id:'+job['key']+(':failed' if 'error' in result else ':complete')
-    status='评审失败，需要重试' if 'error' in result else ('建议修复后合并' if result['issues'] else '未发现明确缺陷')
+    status='达到预算上限，待人工核查' if result.get('error')=='budget_exceeded' else ('评审失败，需要重试' if 'error' in result else ('建议修复后合并' if result['issues'] else '未发现明确缺陷'))
     lines=[f'自动评审：{status}',f'范围：`{job["base"][:10]}...{job["head"][:10]}`','']
     if result.get('model'):lines.append(f'模型：`{result["model"]}` · `{result.get("effort","low")}`')
     if result.get('routing',{}).get('decision')=='escalate':
