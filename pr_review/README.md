@@ -112,3 +112,7 @@ The deep stage gets Spark's context summary and candidates, verifies them indepe
 Automatic execution is bounded to one Spark stage and, if needed, one GPT-6 stage. Completed stages are atomically checkpointed in `results/JOB.json.stages.json`; explicit retry after a deep-stage failure reuses Spark. A different revision invalidates the checkpoint. Increment `routing.VERSION` when changing the triage contract. Failed or evidence-free classification is a review failure, never a clean pass or an automatic expensive fallback.
 
 The notification policy is unchanged: only private bot messages to the PR author, no group fallback, zero findings and unchanged findings remain quiet.
+
+## Visible PR progress
+
+A separate persistent status queue updates one robot-owned comment per PR without waiting for the review engine. New PRs and updated revisions show “queued, please hold merging”; running reviews show “reviewing”; completion links to the full report, and failures explicitly remain unapproved. A clean review still asks for human checks and two-person confirmation. Progress never sends a DM or group message, and unchanged text is not patched repeatedly. This is a visible warning, not an enforced merge lock.
