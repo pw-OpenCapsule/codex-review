@@ -110,7 +110,7 @@ Set `routing: "complexity"` in the private config. Every new review starts with 
 
 The deep stage gets Spark's context summary and candidates, verifies them independently and produces the only final findings. Spark candidates are never published as confirmed deep-review findings. Complexity, reasons, selected model and per-stage measured token usage are stored with the artifact; absent SDK usage stays null rather than zero.
 
-Automatic execution is bounded to one Spark stage and, if needed, one GPT-6 stage. Completed stages are atomically checkpointed in `results/JOB.json.stages.json`; explicit retry after a deep-stage failure reuses Spark. A different revision invalidates the checkpoint. Increment `routing.VERSION` when changing the triage contract. Failed or evidence-free classification is a review failure, never a clean pass or an automatic expensive fallback.
+Automatic execution is bounded to one Spark stage and, if needed, one GPT-6 stage. Completed stages are atomically checkpointed in `cache/SCOPE/review.json.stages.json`; explicit retry after a deep-stage failure reuses Spark. A different revision invalidates the checkpoint. Increment `routing.VERSION` when changing the triage contract. Failed or evidence-free classification is a review failure, never a clean pass or an automatic expensive fallback.
 
 The notification policy is unchanged: only private bot messages to the PR author, no group fallback, zero findings and unchanged findings remain quiet.
 
@@ -129,3 +129,14 @@ A closed/merged PR webhook cancels queued jobs. The worker checks this cancellat
 Set `codex_bin` to the real CLI executable (this deployment uses `/opt/homebrew/bin/codex`), not an interactive statebar/agent wrapper. Each SDK app-server starts with service-owned model context and compaction limits, and the same limits are passed to the thread. Spark: 128,000 context / 80,000 auto-compaction; deep: 256,000 / 180,000. These caps do not alter the user's personal config. Personal hooks, child-agent instructions and automatic project-doc injection are disabled at startup; reviewers read only the task-supplied scope and permitted relevant files.
 
 This prevents a personal million-token context override and interactive runtime hooks from contaminating Spark review requests. Regression verification must include a real PR invocation, not only a tiny model smoke test.
+
+
+## Exact-source reuse and settling
+
+New heads wait `settle_seconds` (default 60) before model execution. Repeated webhooks do not extend the same-head deadline; a new head resets it. Closed PRs are skipped before invoking a model. The durable queue survives restarts.
+
+The project cache key covers repository, full head commit, merge-base, and a hash of review engine/prompt/model configuration. PR number and target tip are excluded: an unchanged head and merge-base mean identical diff and identical available source. Running work survives unrelated target-tip updates; publication still checks current refs and creates a fresh confirmation identity. This is source review reuse, not certification of the target merge result. Changed head, merge-base or policy misses the cache.
+
+Successful results and intermediate stages are shared across equivalent jobs. Failed scopes are also remembered, preventing target updates from repeatedly spending on a known failure; explicit `retry PR` clears that failure marker while retaining completed stages. Cache-hit artifacts have empty `usage_by_stage` and preserve historical usage separately as `cached_usage_by_stage`. No new model request is issued on a complete hit.
+
+OpenAI prompt caching is separate from this disk cache and does not imply free repeated reviews. See https://developers.openai.com/api/docs/guides/prompt-caching . We rely on exact local result reuse for zero model calls, rather than sending an entire project repeatedly hoping for model-side cache hits.
