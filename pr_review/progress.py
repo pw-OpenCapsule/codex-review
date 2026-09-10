@@ -1,8 +1,10 @@
 """One editable PR status comment. Never emits a Lark notification."""
 import json
 try:
+ from .failures import describe
  from .protocol import marker
 except ImportError:
+ from failures import describe
  from protocol import marker
 
 def progress_body(job,head=None,base=None,closed=False):
@@ -25,6 +27,12 @@ def progress_body(job,head=None,base=None,closed=False):
         elif result.get('issues'):title=f'⚠️ 自动评审发现 {len(result["issues"])} 个待处理问题，请处理并完成双人确认后再合并。'
         else:title='✅ 自动评审完成，未发现明确缺陷；仍需人工检查与双人确认。'
     lines=[title,version]
+    result=json.loads((job or {}).get('result') or '{}')
+    if state=='failed' or 'error' in result:
+        reason,action=describe(result.get('reason_code',result.get('error')))
+        lines.append('未完成原因：'+reason+'。')
+        lines.append('下一步：'+action)
+        if result.get('failure_cache_hit'):lines.append('本次复用了已记录的失败原因，没有重新调用模型。')
     if job and job.get('comment_url'):lines.append(f'[查看本次评审]({job["comment_url"]})')
     lines.append('这是评审状态提示，当前 Gogs 合并按钮尚未被技术锁定。')
     if job and job.get('key') and state in ('failed','skipped'):
