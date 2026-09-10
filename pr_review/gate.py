@@ -26,13 +26,30 @@ def evaluate(job,comments,author,reviewers,bot):
             try:state=json.loads(m[1])
             except ValueError:continue
             if state.get('review_key')==job['key'] and state.get('status') in ('unavailable','skipped'):review=c
-        result={'issues':[]}
+        result={'issues':job.get('known_issues',[]) if job['status']=='failed' else []}
     else:
         if not match:return {'allowed':False,'reason':'评审评论尚未发布'}
         review=next((c for c in comments if c['id']==int(match[1])),None)
     if not review:return {'allowed':False,'reason':'无法验证评审评论'}
     if stamp(review)<=0:return {'allowed':False,'reason':'评审时间无法验证'}
     key=job['key'];author=author.casefold();reviewers={x.casefold() for x in reviewers}
+    if job['status']=='failed':
+        decision=None
+        for c in sorted(comments,key=lambda c:(stamp(c),c['id'])):
+            if c['id']<=review['id'] or stamp(c)<stamp(review):continue
+            user=(c.get('user',{}).get('username') or c.get('user',{}).get('login') or '').casefold()
+            if user not in ({author}|reviewers) or user==bot.casefold():continue
+            lines=(c.get('body') or '').strip().splitlines()
+            if not lines:continue
+            m=re.fullmatch(r'/review-agent-decide '+re.escape(key)+r' (merge|hold) (.{6,})',lines[0].strip())
+            if m:decision=(c,m[1],lines[1:])
+        if decision is None:return {'allowed':False,'reason':'等待提交方 Agent 自查并记录合并决定；无需人工参与','decision_policy':'agent'}
+        comment,action,lines=decision
+        if action=='hold':return {'allowed':False,'reason':'Agent 判断暂缓合并','decision_comment_id':comment['id']}
+        count=len([x for x in result.get('issues',[]) if x['severity'] in ('P0','P1','P2')])
+        answers={int(m[1]) for line in lines if (m:=re.fullmatch(r'F([1-9]\d*) (fixed|false-positive) .{6,}',line.strip()))}
+        if answers!=set(range(1,count+1)):return {'allowed':False,'reason':'Agent 尚未逐条处理已有缺陷'}
+        return {'allowed':True,'reason':'服务不可用；Agent 已自查并记录合并依据，无需人工确认','decision_policy':'agent','decision_comment_id':comment['id'],'review_key':key}
     count=len([x for x in result.get('issues',[]) if x['severity'] in ('P0','P1','P2') and x.get('confidence',1)>=.9]);resolution=None;approved=[]
     for c in sorted(comments,key=lambda c:(stamp(c),c['id'])):
         if c['id']<=review['id'] or stamp(c)<stamp(review):continue
