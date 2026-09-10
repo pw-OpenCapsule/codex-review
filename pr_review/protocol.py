@@ -28,7 +28,7 @@ def job_key(repo,n,head,base,d=None):
     return hashlib.sha256(f'{repo}:{n}:{head}:{base}{suffix}'.encode()).hexdigest()
 
 def effective_config(config,d):
-    return {**config,'routing':'fixed' if d['level']=='deep' else 'complexity','model':'gpt-6-astra','effort':'low'}
+    return {**config,'routing':'fixed','model':'gpt-6-astra' if d['level']=='deep' else 'gpt-5.3-codex-spark','effort':'low'}
 
 def marker(job,head,closed=False):
     r=json.loads((job or {}).get('result') or '{}');d=(job or {}).get('declaration',declaration(''))

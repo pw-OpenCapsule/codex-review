@@ -104,15 +104,11 @@ Author self-approval, bot approval, unknown maintainers, missing findings, appro
 
 This Gogs instance has no required-status-check setting and its Git hook management is unavailable. Until the server invokes this checker atomically at merge time, or permissions are redesigned so only an enforcing integration can merge, ordinary Gogs merges can bypass these acknowledgements. Do not claim the merge button is locked. Repository-administrator permissions and deployment boundaries remain outside this service.
 
-## Complexity routing
+## Author-selected review level
 
-Set `routing: "complexity"` in the private config. Every new review starts with `gpt-5.3-codex-spark / low`. Spark completes clear local reviews itself. It requests `gpt-6-astra / low` only with concrete file/line/scenario evidence for interleaved state paths, coupled cross-module constraints, or unresolved verification. Business names, payment-related filenames, severity alone, and mechanically touching many files are not routing rules.
+The submitting session selects the level in the PR body. The service does not classify complexity or automatically upgrade models. `none` skips the model, `spark` uses only Spark low, and `deep` uses only GPT-6 low. Missing declarations default to Spark. Legacy `routing: complexity` configuration does not override this protocol.
 
-The deep stage gets Spark's context summary and candidates, verifies them independently and produces the only final findings. Spark candidates are never published as confirmed deep-review findings. Complexity, reasons, selected model and per-stage measured token usage are stored with the artifact; absent SDK usage stays null rather than zero.
-
-Automatic execution is bounded to one Spark stage and, if needed, one GPT-6 stage. Completed stages are atomically checkpointed in `cache/SCOPE/review.json.stages.json`; explicit retry after a deep-stage failure reuses Spark. A different revision invalidates the checkpoint. Increment `routing.VERSION` when changing the triage contract. Failed or evidence-free classification is a review failure, never a clean pass or an automatic expensive fallback.
-
-The notification policy is unchanged: only private bot messages to the PR author, no group fallback, zero findings and unchanged findings remain quiet.
+Both models may request bounded source snippets. Insufficient context is an unavailable/incomplete review, not permission to upgrade or a clean pass. Exact-source caches include the effective model configuration and engine policy.
 
 ## Visible PR progress
 
@@ -151,8 +147,10 @@ Only a top-level standalone declaration in the PR body selects the requested lev
 [review:deep] Nonempty reason
 ```
 
-Absent declarations default to Spark. `[no-review] reason` aliases `none`. Quoted, fenced, indented-code and HTML-comment examples are ignored. Multiple declarations, unknown levels and missing reasons produce `invalid`, with no model call. `deep` bypasses Spark and calls GPT-6 low directly; `none` produces `skipped`, never a clean review. A declaration/reason change gets a new confirmation identity; the same effective model configuration can still reuse exact-source results. Running/publishing jobs check declaration freshness.
+Absent declarations default to Spark. `[no-review] reason` aliases `none`. Quoted, fenced, indented-code and HTML-comment examples are ignored. Multiple declarations, unknown levels and missing reasons produce `invalid`, with no model call. `spark` calls only Spark low; `deep` calls only GPT-6 low; `none` produces `skipped`, never a clean review. A declaration/reason change gets a new confirmation identity; the same effective model configuration can still reuse exact-source results. Running/publishing jobs check declaration freshness.
 
-Spark may ask for up to three bounded source snippets in one additional turn, within the existing 45-second/40k-token stage budget, before choosing its final route. Missing diff text alone is not an escalation reason. Deep remains bounded. Reports show the actual stage model path.
+Spark may ask for up to three bounded source snippets in one additional turn, within the existing 45-second/40k-token stage budget, before completing its review. There is no automatic model escalation. Deep remains bounded. Reports show the actual stage model path.
 
 The single editable status includes `<!-- pr-review:v1 {JSON} -->` with `head`, `requested`, `status`, `models`, `cache_hit`, `findings`, and an additive `review_key` for machine-verified acknowledgements. Status values are queued/running/completed/skipped/unavailable/invalid/cancelled. Incomplete states have `findings: null`, not zero. No-review and unavailable states still require manual two-person confirmation. The checker verifies the latest known defect report before allowing a manual fallback; none cannot dismiss findings. The checker remains an optional integration, not a Gogs server-enforced lock.
+
+The legacy routing module remains for historical artifact compatibility/tests, but the review execution entrypoint does not invoke it.
