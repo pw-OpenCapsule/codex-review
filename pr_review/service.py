@@ -142,12 +142,14 @@ class Gogs:
         if self.credentials_file:
             refs=git(None,'ls-remote',self.origin+'/'+REPO+'.git','refs/pull/*/head')
             numbers=sorted({int(m[1]) for m in re.finditer(r'refs/pull/(\d+)/head',refs)})
-            result=[]
-            for n in numbers:
-                r=self.session.get(f'{self.origin}/api/v1/repos/{REPO}/issues/{n}',timeout=30);r.raise_for_status()
-                issue=r.json()
-                if issue.get('pull_request') and issue['state']=='open':result.append(n)
-            return result
+            from concurrent.futures import ThreadPoolExecutor
+            def check(n):
+                r=requests.get(f'{self.origin}/api/v1/repos/{REPO}/issues/{n}',headers=dict(self.session.headers),timeout=15)
+                if r.status_code==404:return None
+                r.raise_for_status();issue=r.json()
+                return n if issue.get('pull_request') and issue['state']=='open' else None
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                return [n for n in pool.map(check,numbers) if n is not None]
         # Pagination avoids silently missing PRs beyond the first page.
         found=set()
         for page in range(1,101):
