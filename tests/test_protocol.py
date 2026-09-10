@@ -19,7 +19,9 @@ class ProtocolTests(unittest.TestCase):
   self.assertNotEqual(job_key('r',1,'h','b',a),job_key('r',1,'h','b',b))
  def test_direct_deep_configuration(self):
   self.assertEqual(effective_config({},declaration('[review:deep] a'))['routing'],'fixed')
-  self.assertEqual(effective_config({},declaration(''))['routing'],'complexity')
+  self.assertEqual(effective_config({},declaration(''))['routing'],'fixed')
+  self.assertEqual(effective_config({'routing':'complexity'},declaration(''))['model'],'gpt-5.3-codex-spark')
+  self.assertEqual(effective_config({},declaration('[review:deep] a'))['model'],'gpt-6-astra')
  def test_unavailable_is_not_zero_findings_pass(self):
   text=marker({'status':'failed'},'h');self.assertIn('"status":"unavailable"',text);self.assertIn('"findings":null',text)
  def test_none_and_invalid_do_not_start_models(self):

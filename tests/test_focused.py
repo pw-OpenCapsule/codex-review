@@ -33,3 +33,11 @@ class FocusedTests(unittest.TestCase):
   with self.assertRaises(ReviewBudgetExceeded):
    focused_review(turn,lambda r:reads.append(r))
   self.assertEqual(len(reads),8)
+
+ def test_spark_incomplete_stops_after_two_rounds(self):
+  calls=[]
+  def turn(extra):
+   calls.append(extra)
+   return {'decision':'need_context','requests':[{'file':'a'}]},None
+  with self.assertRaises(ReviewBudgetExceeded):focused_review(turn,lambda req:{'content':'a'},max_rounds=2,max_reads=3)
+  self.assertEqual(len(calls),2)
