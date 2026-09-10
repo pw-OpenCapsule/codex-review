@@ -39,7 +39,7 @@ def marker(job,head,closed=False):
     for v in r.get('usage_by_stage',r.get('cached_usage_by_stage',{})).values():
         m=v.get('model');label='spark' if m=='gpt-5.3-codex-spark' else 'gpt6-low' if m=='gpt-6-astra' else m
         if label and label not in models:models.append(label)
-    if not models and r.get('model'):models=['spark' if r['model']=='gpt-5.3-codex-spark' else 'gpt6-low']
+    if not models and r.get('model'):models=['spark' if r['model']=='gpt-5.3-codex-spark' else 'gpt6-low' if r['model']=='gpt-6-astra' else r['model']]
     value={'head':head,'requested':d['level'],'status':status,'models':models,'cache_hit':r.get('cache',{}).get('hit',False),'findings':len(r.get('issues',[])) if status=='completed' else None}
     value['reason_code']=r.get('reason_code',r.get('error'))
     value['reason']=r.get('reason')
