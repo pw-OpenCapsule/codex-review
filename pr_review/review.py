@@ -69,7 +69,7 @@ def main():
   if os.environ.get('CODEX_REVIEW_BACKEND','codex')!='chatgpt-use':return sdk_run(model,instructions,schema)
   web_model=os.environ.get('CHATGPT_REVIEW_MODEL')
   if not web_model:raise ValueError('chatgpt-use model mapping not configured')
-  round_no=0;history=[];deadline=time.monotonic()+(45 if model==SPARK else 180)
+  round_no=0;history=[];deadline=time.monotonic()+(180 if model==SPARK else 240)
   def turn(extra):
    nonlocal round_no
    remaining=deadline-time.monotonic()
