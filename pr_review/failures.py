@@ -1,5 +1,6 @@
 """Stable public failure reasons; raw provider logs stay private."""
 REASONS={
+ 'channel_paused':('评审渠道已由维护者暂停','可走人工评审；不会自动切换 Codex，恢复渠道后再处理。'),
  'quota_exhausted':('模型账户额度不足或请求限流','等待额度恢复后显式重试，或由两位人员完成人工确认。'),
  'context_insufficient':('已提供的代码片段不足以完成核验','补充相关上下文后重试，或由两位人员完成人工确认。'),
  'context_window_exceeded':('模型上下文窗口不足','维护者缩减或调整输入后重试；这不是账户额度不足。'),
