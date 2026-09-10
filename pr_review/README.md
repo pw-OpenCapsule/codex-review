@@ -154,3 +154,25 @@ Spark may ask for up to three bounded source snippets in one additional turn, wi
 The single editable status includes `<!-- pr-review:v1 {JSON} -->` with `head`, `requested`, `status`, `models`, `cache_hit`, `findings`, and an additive `review_key` for machine-verified acknowledgements. Status values are queued/running/completed/skipped/unavailable/invalid/cancelled. Incomplete states have `findings: null`, not zero. No-review and unavailable states still require manual two-person confirmation. The checker verifies the latest known defect report before allowing a manual fallback; none cannot dismiss findings. The checker remains an optional integration, not a Gogs server-enforced lock.
 
 The legacy routing module remains for historical artifact compatibility/tests, but the review execution entrypoint does not invoke it.
+
+## Optional chatgpt-use backend
+
+The read-only `ask --output-schema` adapter is implemented and offline-tested. It does not enable run/work/MCP/local tool execution. It requires a recent chatgpt-use build containing structured output, durable request IDs, resume and SIGTERM cancellation. Configure explicitly:
+
+```json
+{
+  "backend": "chatgpt-use",
+  "chatgpt_use": {
+    "bin": "/absolute/path/chatgpt-use",
+    "profile": "auto",
+    "session": "chatgpt-web",
+    "models": {"spark": "instant", "deep": "medium"}
+  }
+}
+```
+
+These are **web model mappings**, not the identically named Codex models. Operator approval of this mapping is required before switching a deployment. Results record `chatgpt-web:<selection>` and token usage is unavailable, not zero. Provider and mapping participate in the cache identity.
+
+Each bounded context round has a deterministic request ID and a private JSON envelope. A duplicate ID invokes resume, never a second ask. Busy/unavailable/malformed/incomplete results stop without automatic retry, account switching or Codex fallback. A completed local envelope can be reused without any browser call.
+
+On cancellation the parent sends SIGTERM and allows 30 seconds for upstream to stop its pinned conversation, before a last-resort kill. An unconfirmed remote cancellation is not a confirmed stop: retain upstream receipts and reconcile by request ID. Upstream explicitly has not live-verified the owner-SIGKILL cancellation path. This adapter was verified offline only; upstream forbids live browser testing to conserve the signed-in account's request budget. Integration activation and organic production observation must not be described as a successful synthetic end-to-end test.

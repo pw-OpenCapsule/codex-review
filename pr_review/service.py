@@ -405,6 +405,13 @@ class Worker:
             engine_env={k:v for k,v in os.environ.items() if k in
                 {'PATH','HOME','USER','LOGNAME','TMPDIR','LANG','CODEX_HOME','CODEX_REVIEW_MODEL'}}
             if self.cfg.get('codex_bin'):engine_env['CODEX_REVIEW_BIN']=self.cfg['codex_bin']
+            engine_env['CODEX_REVIEW_BACKEND']=review_cfg.get('backend','codex')
+            if engine_env['CODEX_REVIEW_BACKEND']=='chatgpt-use':
+                web=review_cfg.get('chatgpt_use',{})
+                engine_env['CHATGPT_REVIEW_BIN']=web['bin']
+                engine_env['CHATGPT_REVIEW_MODEL']=web['models'][d['level']]
+                engine_env['CHATGPT_REVIEW_PROFILE']=web.get('profile','auto')
+                engine_env['CHATGPT_REVIEW_SESSION']=web.get('session','chatgpt-web')
             engine_env['CODEX_REVIEW_MODEL']=review_cfg['model']
             engine_env['CODEX_REVIEW_EFFORT']=self.cfg.get('effort','low')
             engine_env['CODEX_REVIEW_ROUTING']=review_cfg['routing']
@@ -496,7 +503,12 @@ class Worker:
 
     def kill_child(self):
         if self.child and self.child.poll() is None:
-            try:os.killpg(self.child.pid,signal.SIGKILL)
+            try:
+                if self.cfg.get('backend')=='chatgpt-use':
+                    os.killpg(self.child.pid,signal.SIGTERM)
+                    try:self.child.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:pass
+                if self.child.poll() is None:os.killpg(self.child.pid,signal.SIGKILL)
             except ProcessLookupError:pass
             self.child.communicate()
 

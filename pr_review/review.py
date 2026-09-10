@@ -5,6 +5,7 @@ from openai_codex import Codex,CodexConfig,Sandbox,ApprovalMode
 from routing import atomic_json,SPARK
 from budget import collect_bounded,ReviewBudgetExceeded
 from model_profile import context_limits,startup_overrides
+from web_transport import send as web_send
 from focused import focused_schema,focused_review,read_context
 
 SCHEMA={'type':'object','properties':{'issues':{'type':'array','items':{'type':'object','properties':{
@@ -34,7 +35,7 @@ def main():
  conf={}
  if (home/'config.toml').exists():conf=tomllib.loads((home/'config.toml').read_text())
  cfg={'features':{'multi_agent':False,'shell_snapshot':False,'hooks':False,'child_agents_md':False},'mcp_servers':{k:{'enabled':False} for k in conf.get('mcp_servers',{})},'web_search':'disabled','model_reasoning_effort':os.environ.get('CODEX_REVIEW_EFFORT','low')}
- def run(model,instructions,schema):
+ def sdk_run(model,instructions,schema):
   stage_cfg={**cfg,**context_limits(model),'features':{**cfg['features'],'shell_tool':False,'unified_exec':False}}
   with Codex(config=CodexConfig(codex_bin=os.environ.get('CODEX_REVIEW_BIN') or shutil.which('codex'),cwd=str(cwd),config_overrides=startup_overrides(model))) as codex:
    thread=codex.thread_start(cwd=str(cwd),sandbox=Sandbox.read_only,approval_mode=ApprovalMode.deny_all,
@@ -64,10 +65,28 @@ def main():
     if not resolved.is_relative_to(cwd):raise ValueError('model referenced a path outside checkout')
     e['file']=resolved.relative_to(cwd).as_posix()
    return parsed,usage
+ def run(model,instructions,schema):
+  if os.environ.get('CODEX_REVIEW_BACKEND','codex')!='chatgpt-use':return sdk_run(model,instructions,schema)
+  web_model=os.environ.get('CHATGPT_REVIEW_MODEL')
+  if not web_model:raise ValueError('chatgpt-use model mapping not configured')
+  round_no=0;history=[];deadline=time.monotonic()+(45 if model==SPARK else 180)
+  def turn(extra):
+   nonlocal round_no
+   remaining=deadline-time.monotonic()
+   if remaining<=0:raise ReviewBudgetExceeded('stage time budget exceeded')
+   if extra:history.append(extra)
+   message=RULES+'\n'+prompt+'\n'+instructions+'\n只用所给上下文；需要补片段用 requests，信息不足返回 insufficient_context，不升级模型。\n'+'\n'.join(history)
+   value,usage=web_send(os.environ['CHATGPT_REVIEW_BIN'],message,focused_schema(schema),a.output,round_no,web_model,remaining,profile=os.environ.get('CHATGPT_REVIEW_PROFILE','auto'),session=os.environ.get('CHATGPT_REVIEW_SESSION','chatgpt-web'))
+   round_no+=1
+   return value,usage
+  parsed,_=focused_review(turn,lambda req:read_context(cwd,req),max_rounds=2 if model==SPARK else 4,max_reads=3 if model==SPARK else 8)
+  parsed['provider']={'backend':'chatgpt-use','requested_model':web_model,'usage_available':False}
+  return parsed,None
  model=os.environ.get('CODEX_REVIEW_MODEL',SPARK)
  if model not in (SPARK,'gpt-6-astra'):raise ValueError('unsupported review model')
  parsed,usage=run(model,'完成指定差异的只读评审，不做复杂度分流。',SCHEMA)
- parsed.update(model=model,effort='low',usage_by_stage={'fixed':{'model':model,'usage':usage}})
+ actual_model='chatgpt-web:'+parsed['provider']['requested_model'] if parsed.get('provider') else model
+ parsed.update(model=actual_model,effort=parsed.get('provider',{}).get('requested_model','low'),usage_by_stage={'fixed':{'model':actual_model,'usage':usage}})
  atomic_json(a.output,parsed)
 
 if __name__=='__main__':
