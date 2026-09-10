@@ -5,6 +5,7 @@ from openai_codex import Codex,CodexConfig,Sandbox,ApprovalMode
 from routing import atomic_json,SPARK
 from budget import collect_bounded,ReviewBudgetExceeded
 from model_profile import context_limits,startup_overrides
+from review_tools import tool_schema,review_loop,execute as execute_review_tool
 from web_transport import send as web_send
 from focused import focused_schema,focused_review,read_context
 
@@ -75,11 +76,11 @@ def main():
    remaining=deadline-time.monotonic()
    if remaining<=0:raise ReviewBudgetExceeded('stage time budget exceeded')
    if extra:history.append(extra)
-   message=RULES+'\n'+prompt+'\n'+instructions+'\n只用所给上下文；需要补片段用 requests，信息不足返回 insufficient_context，不升级模型。\n'+'\n'.join(history)
-   value,usage=web_send(os.environ['CHATGPT_REVIEW_BIN'],message,focused_schema(schema),a.output,round_no,web_model,remaining,profile=os.environ.get('CHATGPT_REVIEW_PROFILE','auto'),session=os.environ.get('CHATGPT_REVIEW_SESSION','chatgpt-web'))
+   message=RULES+'\n'+prompt+'\n'+instructions+'\n你可以自主调用只读本地工具核查逻辑：read_file（head 文件片段）、search_code（字面量搜索，可查调用者）、list_files（目录文件）、git_diff（本PR指定文件差异）、git_show（base/head源码）、git_blame（历史归属）。用 tool_calls 请求，每轮最多3个。path 是仓库相对路径，query 是搜索词，revision 只能 base/head，start_line/end_line 最多160行；不适用的字段用空字符串和1。禁止请求写入、网络、执行项目脚本。补足具体证据后完成；信息不足返回 insufficient_context，不升级模型。\n'+'\n'.join(history)
+   value,usage=web_send(os.environ['CHATGPT_REVIEW_BIN'],message,tool_schema(schema),a.output,round_no,web_model,remaining,profile=os.environ.get('CHATGPT_REVIEW_PROFILE','auto'),session=os.environ.get('CHATGPT_REVIEW_SESSION','chatgpt-web'))
    round_no+=1
    return value,usage
-  parsed,_=focused_review(turn,lambda req:read_context(cwd,req),max_rounds=2 if model==SPARK else 4,max_reads=3 if model==SPARK else 8)
+  parsed,_=review_loop(turn,lambda req:execute_review_tool(cwd,a.base,a.head,req),max_rounds=3 if model==SPARK else 5,max_calls=6 if model==SPARK else 12)
   parsed['provider']={'backend':'chatgpt-use','requested_model':web_model,'usage_available':False}
   return parsed,None
  model=os.environ.get('CODEX_REVIEW_MODEL',SPARK)
