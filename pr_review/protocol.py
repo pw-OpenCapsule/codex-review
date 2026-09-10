@@ -41,5 +41,7 @@ def marker(job,head,closed=False):
         if label and label not in models:models.append(label)
     if not models and r.get('model'):models=['spark' if r['model']=='gpt-5.3-codex-spark' else 'gpt6-low']
     value={'head':head,'requested':d['level'],'status':status,'models':models,'cache_hit':r.get('cache',{}).get('hit',False),'findings':len(r.get('issues',[])) if status=='completed' else None}
+    value['reason_code']=r.get('reason_code',r.get('error'))
+    value['reason']=r.get('reason')
     value['review_key']=(job or {}).get('key')
     return '<!-- pr-review:v1 '+json.dumps(value,ensure_ascii=False,separators=(',',':'))+' -->'

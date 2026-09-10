@@ -11,6 +11,7 @@ try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
     from .auto_merge import eligibility as merge_eligibility,dispatch as merge_dispatch
+    from .failures import classify,CachedFailure
     from .protocol import declaration,job_key,effective_config
     from .progress import progress_body
     from .reuse import policy_digest,cache_key,stable_remaining
@@ -19,6 +20,7 @@ except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
     from auto_merge import eligibility as merge_eligibility,dispatch as merge_dispatch
+    from failures import classify,CachedFailure
     from protocol import declaration,job_key,effective_config
     from progress import progress_body
     from reuse import policy_digest,cache_key,stable_remaining
@@ -396,7 +398,7 @@ class Worker:
             cached_path=shared/'review.json'
             cache_hit=cached_path.exists()
             self.store.set_meta('cache:'+job['key'],shared.name)
-            if (shared/'failure.json').exists():raise ValueError('cached failed scope; explicit retry required')
+            if (shared/'failure.json').exists():raise CachedFailure(json.loads((shared/'failure.json').read_text()))
             # Isolated child bounds the entire SDK call, including startup and stalled turns.
             cmd=[sys.executable,str(Path(__file__).with_name('review.py')),'--cwd',str(cwd),
                 '--base',merge,'--head',head,'--output',str(cached_path)]
@@ -447,18 +449,25 @@ class Worker:
                 except Exception:issue['owner_lark_id']=people.get(p.get('author','').casefold())
             result.setdefault('model',engine_env['CODEX_REVIEW_MODEL']);result.setdefault('effort',engine_env['CODEX_REVIEW_EFFORT'])
             self.store.update(job['key'],status='ready',result=json.dumps(result,ensure_ascii=False))
+        except CachedFailure as e:
+            result={**e.result,'failure_cache_hit':True}
+            self.store.update(job['key'],status='failed',result=json.dumps(result,ensure_ascii=False))
         except ReviewBudgetStopped:
-            if 'shared' in locals():(shared/'failure.json').write_text(json.dumps({'error':'budget_exceeded'}))
-            self.store.update(job['key'],status='failed',result=json.dumps({'error':'budget_exceeded'}))
+            log=result_path.with_suffix('.log')
+            result=classify(log.read_text() if log.exists() else '',fallback='budget_exceeded')
+            if 'shared' in locals():(shared/'failure.json').write_text(json.dumps(result,ensure_ascii=False))
+            self.store.update(job['key'],status='failed',result=json.dumps(result,ensure_ascii=False))
         except ReviewSuperseded:
             self.store.update(job['key'],status='stale',notified=1)
             self.store.enqueue(n)
             print(f'review {n} cancelled: PR closed or revision replaced',flush=True)
         except Exception as e:
-            if 'shared' in locals() and not cache_hit:(shared/'failure.json').write_text(json.dumps({'error':type(e).__name__}))
+            log=result_path.with_suffix('.log')
+            result=classify(log.read_text() if log.exists() else '')
+            if 'shared' in locals() and not cache_hit:(shared/'failure.json').write_text(json.dumps(result,ensure_ascii=False))
             self.kill_child()
             print(f'review {n} failed: {type(e).__name__}',flush=True)
-            self.store.update(job['key'],status='failed',result=json.dumps({'error':type(e).__name__}))
+            self.store.update(job['key'],status='failed',result=json.dumps(result,ensure_ascii=False))
         finally:
             self.store.enqueue_status(n)
             if cwd.exists():git(self.mirror,'worktree','remove','--force',str(cwd))
