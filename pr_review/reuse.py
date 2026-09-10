@@ -4,7 +4,7 @@ from pathlib import Path
 
 def policy_digest(config):
     root=Path(__file__).parent
-    files=('review.py','routing.py','focused.py','budget.py','model_profile.py','reuse.py','web_transport.py')
+    files=('review.py','routing.py','focused.py','budget.py','model_profile.py','reuse.py','web_transport.py','review_tools.py')
     h=hashlib.sha256()
     for name in files:h.update(name.encode()+b'\0'+(root/name).read_bytes())
     h.update(json.dumps({k:config.get(k) for k in ('routing','model','effort','codex_bin','backend','chatgpt_use')},sort_keys=True).encode())
