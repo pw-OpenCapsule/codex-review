@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 try:
     from .notifications import read_people,meaningful,fingerprints,digest_card
     from .gate import evaluate as evaluate_gate
+    from .auto_merge import eligibility as merge_eligibility,dispatch as merge_dispatch
     from .protocol import declaration,job_key,effective_config
     from .progress import progress_body
     from .reuse import policy_digest,cache_key,stable_remaining
@@ -17,6 +18,7 @@ try:
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
+    from auto_merge import eligibility as merge_eligibility,dispatch as merge_dispatch
     from protocol import declaration,job_key,effective_config
     from progress import progress_body
     from reuse import policy_digest,cache_key,stable_remaining
@@ -121,7 +123,7 @@ class Gogs:
             if not issue.get('pull_request'):raise UnsupportedPR('not a PR')
             if issue['state']!='open' or issue['pull_request'].get('merged'):
                 return {'number':number,'head':'','base':'','title':f'#{number} '+issue['title'],
-                        'url':f'{self.origin}/{REPO}/pulls/{number}','closed':True,
+                        'url':f'{self.origin}/{REPO}/pulls/{number}','closed':True,'merged':bool(issue['pull_request'].get('merged')),
                         'body':issue.get('body',''),'author':issue['user'].get('username') or issue['user'].get('login')}
             meta=self.metadata_store.meta('pr_refs:'+str(number)) if self.metadata_store else None
             if not meta:raise UnsupportedPR('PR branch metadata missing; redeliver the PR webhook')
@@ -365,7 +367,10 @@ class Worker:
         if not d['valid'] or d['level']=='none':
             status='invalid' if not d['valid'] else 'skipped'
             self.store.update(job['key'],status=status,result=json.dumps({'reason':d['reason']}),notified=1)
-            self.store.enqueue_status(n);return
+            self.store.enqueue_status(n)
+            if status=='skipped' and self.cfg.get('auto_merge',{}).get('enabled'):
+                self.auto_merge_none(p,job,d)
+            return
         if git(self.mirror,'merge-base',base,head)==head:
             self.store.update(job['key'],status='skipped',result=json.dumps({'reason':'源码已包含在目标分支'}),notified=1)
             self.store.enqueue_status(n);return
@@ -457,6 +462,29 @@ class Worker:
         finally:
             self.store.enqueue_status(n)
             if cwd.exists():git(self.mirror,'worktree','remove','--force',str(cwd))
+    def auto_merge_none(self,p,job,d):
+        config=self.cfg['auto_merge'];receipt_key='auto_merge:'+job['key']
+        if self.store.meta(receipt_key) is not None:return
+        comments=self.gogs.comments(job['pr'])
+        with self.store.db() as c:
+            rows=c.execute("SELECT result FROM jobs WHERE pr=? AND status='ready'",(job['pr'],)).fetchall()
+        known=any(json.loads(r['result'] or '{}').get('issues') for r in rows)
+        allowed,reason=merge_eligibility(d,p['author'],config.get('authors',[]),comments,self.gogs.username,known)
+        if not allowed:return
+        current=self.gogs.page(job['pr'])
+        if current['closed'] or self.current_refs(current)!=(job['head'],job['base']) or declaration(current.get('body',''))!=d:return
+        # Persist intent before dispatch. An uncertain response must be reconciled,
+        # not blindly retried after restart.
+        self.store.set_meta(receipt_key,{'status':'submitted'})
+        request={'repo':REPO,'pr':job['pr'],'head':job['head'],'base':job['base'],'reason':d['reason'],'request_id':job['key'],'identity':'robot'}
+        try:
+            receipt=merge_dispatch(config,request)
+            if receipt.get('status')=='merged' and not self.gogs.page(job['pr']).get('merged',False):raise ValueError('merge not confirmed by host')
+            self.store.set_meta(receipt_key,receipt)
+        except Exception as e:
+            self.store.set_meta(receipt_key,{'status':'unknown','error':type(e).__name__})
+        self.store.enqueue_status(job['pr'])
+
     def kill_child(self):
         if self.child and self.child.poll() is None:
             try:os.killpg(self.child.pid,signal.SIGKILL)
