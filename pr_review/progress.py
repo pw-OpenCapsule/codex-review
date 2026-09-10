@@ -19,10 +19,10 @@ def progress_body(job,head=None,base=None,closed=False):
     elif state=='running':
         title='🔎 自动评审中，请暂缓合并。'
     elif state=='failed':
-        title='⚪ 自动评审未完成（服务不可用），请走双人人工确认；服务故障或额度不足不阻止人工合并。已有缺陷仍需处理或说明误报。'
+        title='⚪ 自动评审未完成（服务不可用），由提交方 Agent 自查代码、测试、已有意见及冲突后，自行决定合并或暂缓，无需人工参与。已有缺陷仍需处理或说明误报。'
     else:
         result=json.loads(job.get('result') or '{}')
-        if 'error' in result:title='⚪ 自动评审未完成（服务不可用），请走双人人工确认；已有缺陷仍需处理或说明误报。'
+        if 'error' in result:title='⚪ 自动评审未完成（服务不可用），由提交方 Agent 自查后决定合并或暂缓，无需人工参与；已有缺陷仍需处理或说明误报。'
         elif not job.get('comment_url'):title='🔎 评审结果正在发布，请暂缓合并。'
         elif result.get('issues'):title=f'⚠️ 自动评审发现 {len(result["issues"])} 个待处理问题，请处理并完成双人确认后再合并。'
         else:title='✅ 自动评审完成，未发现明确缺陷；仍需人工检查与双人确认。'
@@ -31,11 +31,13 @@ def progress_body(job,head=None,base=None,closed=False):
     if state=='failed' or 'error' in result:
         reason,action=describe(result.get('reason_code',result.get('error')))
         lines.append('未完成原因：'+reason+'。')
-        lines.append('下一步：'+action)
+        lines.append('下一步：'+action+' 当前合并由提交方 Agent 自查决定，无需等待人工。')
         if result.get('failure_cache_hit'):lines.append('本次复用了已记录的失败原因，没有重新调用模型。')
     if job and job.get('comment_url'):lines.append(f'[查看本次评审]({job["comment_url"]})')
     lines.append('这是评审状态提示，当前 Gogs 合并按钮尚未被技术锁定。')
-    if job and job.get('key') and state in ('failed','skipped'):
+    if job and job.get('key') and state=='failed':
+        lines.append(f'Agent 留痕：`/review-agent-decide {job["key"]} merge 核查依据` 或 `/review-agent-decide {job["key"]} hold 暂缓原因`。已有缺陷按原报告编号附 `F1 fixed 依据` / `F1 false-positive 依据`。合并前仍需核对当前版本、冲突和仓库权限。')
+    if job and job.get('key') and state=='skipped':
         lines.append(f'人工确认：作者 `/review-resolve {job["key"]}`；另一位维护者 `/review-approve {job["key"]} 核对依据`。')
     lines.append(marker(job,head))
     return '\n\n'.join(x for x in lines if x)

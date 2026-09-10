@@ -16,7 +16,7 @@ class ProgressTests(unittest.TestCase):
   self.assertIn('正在发布',progress_body({'status':'ready','result':'{"issues":[]}'},'a','b'))
  def test_failed_review_blocks_recommendation(self):
   body=progress_body({'status':'failed'},'a','b')
-  self.assertIn('未完成',body);self.assertIn('双人人工确认',body);self.assertNotIn('暂缓合并',body)
+  self.assertIn('未完成',body);self.assertIn('无需人工参与',body);self.assertNotIn('暂缓合并',body)
  def test_same_comment_is_edited_and_unchanged_body_is_not_reposted(self):
   g=object.__new__(Gogs);g.username='robot';g.origin='https://git';g.session=Mock()
   with patch('pr_review.service.REPO','games/aeroplane'):

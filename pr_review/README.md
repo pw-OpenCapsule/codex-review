@@ -183,3 +183,14 @@ On cancellation the parent sends SIGTERM and allows 30 seconds for upstream to s
 The web backend now runs a bounded tool loop instead of only requesting preselected snippets. The model chooses `read_file`, `search_code`, `list_files`, `git_diff`, `git_show` or `git_blame` through validated JSON tool calls. The local controller executes these against the pinned checkout and base/head revisions, then returns bounded results for the next reasoning turn. Search is literal, Git executes without a shell/external diff/textconv, and file access cannot escape the checkout. Arbitrary bash, project scripts, writes and network tools are not exposed.
 
 Light reviews allow 3 response rounds and 6 tool calls; deep reviews allow 5 response rounds and 12 calls, with up to 3 calls per response. Each tool result is capped at 12k characters (file reads at 10k), requested line ranges at 160, and the existing overall time limits remain. Insufficient evidence and exhausted tool budgets stay incomplete. `tools_used` in the review artifact records the model-selected tool names and paths. The underlying structured ask/receipt/resume/cancellation transport remains unchanged: this controller adds tool execution without using upstream's unrestricted `run` loop. Tests are offline; the earlier live one-shot success is not proof of live tool-loop success.
+
+
+## Unavailable-service policy: agent decides
+
+When status is `unavailable` (including an operator-paused channel), the submitting agent examines the code, available tests, existing comments, current refs and conflicts, then decides without human or second-person approval. It records one authenticated PR comment:
+
+```
+/review-agent-decide REVIEW_KEY merge Concrete verification and rationale
+```
+
+or `hold` instead of `merge`. The comment must come from the PR author or an allowed maintainer identity, after the current robot status. If the last successful report had findings, append an F-numbered `fixed` or `false-positive` explanation for each. A newer `hold` supersedes an earlier merge decision. This path does not grant repository write permissions, resolve conflicts or execute merges itself; the submitting agent uses its existing authorized merge tooling. The machine marker includes `decision_policy: "agent"`. This supersedes earlier documentation requiring two humans during service outages; normal successful-review acknowledgement rules are unchanged. Channels remain paused until explicitly resumed.

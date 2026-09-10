@@ -605,12 +605,15 @@ class Worker:
         key=job_key(REPO,number,head,base,d)
         with self.store.db() as c:r=c.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
         comments=self.notify_gogs.comments(number)
+        r=dict(r) if r else None
         if r and r['status'] in ('failed','skipped'):
             # Switching to none/unavailable does not erase the last known defects.
             with self.store.db() as c:prior=c.execute("SELECT * FROM jobs WHERE pr=? AND status='ready' AND comment_url IS NOT NULL ORDER BY rowid DESC LIMIT 1",(number,)).fetchone()
             if prior and json.loads(prior['result']).get('issues'):
-                old=evaluate_gate(dict(prior),comments,p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
-                if not old['allowed']:return {'allowed':False,'reason':'已有评审缺陷尚未完成处理与双人确认'}
+                if r['status']=='failed':r['known_issues']=json.loads(prior['result'])['issues']
+                else:
+                    old=evaluate_gate(dict(prior),comments,p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
+                    if not old['allowed']:return {'allowed':False,'reason':'已有评审缺陷尚未完成处理与双人确认'}
         return evaluate_gate(dict(r) if r else None,comments,p['author'],self.cfg.get('reviewers',[]),self.notify_gogs.username)
 
     def sync_status(self,number):
