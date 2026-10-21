@@ -16,6 +16,7 @@ try:
     from .progress import progress_body
     from .reuse import policy_digest,cache_key,stable_remaining
     from .direct_messages import author_recipient,dm_text,delivery_key,send_direct
+    from .hosts import same_gogs_host
 except ImportError:
     from notifications import read_people,meaningful,fingerprints,digest_card
     from gate import evaluate as evaluate_gate
@@ -25,6 +26,7 @@ except ImportError:
     from progress import progress_body
     from reuse import policy_digest,cache_key,stable_remaining
     from direct_messages import author_recipient,dm_text,delivery_key,send_direct
+    from hosts import same_gogs_host
 
 REPO = os.environ.get('PR_REVIEW_REPO', 'example/project')
 SHA = re.compile(r'^[0-9a-f]{40}$')
@@ -101,7 +103,7 @@ class Gogs:
     def login(self):
         if self.credentials_file:
             cred=json.loads(Path(self.credentials_file).read_text())
-            if cred['host']!=urlparse(self.origin).netloc:raise ValueError('credential host mismatch')
+            if not same_gogs_host(cred['host'],urlparse(self.origin).netloc):raise ValueError('credential host mismatch')
             self.session.headers['Authorization']='token '+cred['token']
             r=self.session.get(self.origin+'/api/v1/user',timeout=30);r.raise_for_status()
             self.username=r.json().get('username') or r.json().get('login')
@@ -316,6 +318,8 @@ class Worker:
         self.notify_gogs=Gogs(config['gogs_origin'],config.get('gogs_credentials_file'),store)
         self.status_gogs=Gogs(config['gogs_origin'],config.get('gogs_credentials_file'),store)
         self.mirror=Path(config['state_dir'])/'mirror.git'
+        # Gogs.login() above already reached Gogs; this also gives a fresh start a grace period.
+        self.last_gogs_ok=time.time();self.last_error=None;self.last_error_at=None
         if not self.mirror.exists():git(None,'clone','--mirror',config['gogs_origin']+'/'+REPO+'.git',str(self.mirror))
     def refs(self,p):
         git(self.mirror,'fetch','--prune','origin')
@@ -352,14 +356,25 @@ class Worker:
                         self.kill_child();raise ReviewSuperseded('PR closed, merged or revision replaced')
                     next_check=time.monotonic()+5
 
+    def health(self,now=None):
+        """503 once Gogs has not answered discovery for longer than health_stale_seconds."""
+        now=time.time() if now is None else now
+        limit=self.cfg.get('health_stale_seconds',max(900,3*self.cfg.get('poll_seconds',120)))
+        iso=lambda t:time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(t)) if t else None
+        stale=now-self.last_gogs_ok>limit
+        return 503 if stale else 200,{'status':'stale' if stale else 'ok','last_success':iso(self.last_gogs_ok),
+            'last_error':self.last_error,'last_error_at':iso(self.last_error_at),'stale_after_seconds':limit}
     def process(self,n):
         if n==0:
-            for number in self.gogs.open_prs():
+            numbers=self.gogs.open_prs();self.last_gogs_ok=time.time()
+            for number in numbers:
                 self.store.enqueue(number);self.store.enqueue_status(number)
             return
         try:p=self.gogs.page(n)
         except UnsupportedPR as e:
+            self.last_gogs_ok=time.time()
             print(f'PR {n} skipped: {e}',flush=True);return
+        self.last_gogs_ok=time.time()
         if p['closed']:
             self.store.cancel_pr(n);return
         self.store.set_meta('pr_closed:'+str(n),False)
@@ -661,6 +676,7 @@ class Worker:
                 if n is not None:
                     try:self.process(n)
                     except Exception as e:
+                        self.last_error=type(e).__name__;self.last_error_at=time.time()
                         print(f'PR discovery failed: {type(e).__name__}',flush=True)
                         time.sleep(5)  # next periodic scan retries discovery without starving other PRs
                 for job in self.store.retry_jobs():
@@ -673,9 +689,13 @@ class Worker:
             except Exception as e:
                 print(f'worker loop: {type(e).__name__}',flush=True);time.sleep(15)
 
-def server(config,store,gate_checker=None):
+def server(config,store,gate_checker=None,health=None):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path=='/health' and health:
+                code,state=health()
+                self.send_response(code);self.send_header('Content-Type','application/json');self.end_headers()
+                self.wfile.write(json.dumps(state).encode());return
             self.send_response(200 if self.path=='/health' else 404);self.end_headers();self.wfile.write(b'pr-review')
         def do_POST(self):
             if self.path not in ('/hooks/gogs','/merge-gate/check'):self.send_error(404);return
@@ -749,6 +769,6 @@ def main():
         raise SystemExit(0)
     signal.signal(signal.SIGTERM,terminate)
     signal.signal(signal.SIGINT,terminate)
-    server(config,store,worker.check_gate).serve_forever()
+    server(config,store,worker.check_gate,worker.health).serve_forever()
 
 if __name__=='__main__':main()
