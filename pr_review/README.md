@@ -48,11 +48,12 @@ Put this JSON outside the checkout, chmod 600, in a private state directory (chm
   "bind": "127.0.0.1",
   "port": 9847,
   "poll_seconds": 120,
+  "health_stale_seconds": 900,
   "review_timeout": 900
 }
 ```
 
-Run `python pr_review/service.py /private/config.json`. The daemon needs the same HOME, PATH and Git credential access as the configured user. Expose only this loopback service through a persistent Tunnel. Point Gogs to `https://YOUR-DOMAIN/hooks/gogs`, JSON, same webhook secret, PR + push events. GET /health is a public liveness endpoint; no configuration, logs or repository contents are exposed.
+Run `python pr_review/service.py /private/config.json`. The daemon needs the same HOME, PATH and Git credential access as the configured user. Expose only this loopback service through a persistent Tunnel. Point Gogs to `https://YOUR-DOMAIN/hooks/gogs`, JSON, same webhook secret, PR + push events. GET /health returns JSON with the last time Gogs answered discovery (`last_success`) and the exception type of the latest discovery failure (`last_error`, `last_error_at`); it turns 503 when Gogs has not answered for `health_stale_seconds` (default the larger of 900 and 3 × `poll_seconds`). No configuration, URLs, log text or repository contents are exposed.
 
 For macOS, use launchd with KeepAlive and RunAtLoad, the absolute virtualenv Python/script/config paths, a working directory pointing to this checkout, and stdout/stderr files under the private state directory. Service SIGTERM stops the active SDK process group. On restart, incomplete reviews become pending; outbox retries and idempotency state survive.
 
@@ -80,7 +81,7 @@ Zero findings and unchanged findings remain quiet. Each delivery has a stable AP
 
 ## Robot credential file
 
-Outside Git, chmod 600, containing `host`, `username` and `token`. The token belongs to the dedicated robot, with read access and comment permission for each enabled project. The daemon verifies its API identity. Git uses a host-scoped helper; the model process does not inherit this file path or token. Human account credentials are not used as a fallback.
+Outside Git, chmod 600, containing `host`, `username` and `token`. `host` must equal the netloc of `gogs_origin`, except that names of the same Gogs listed in `pr_review/hosts.py` are interchangeable (the company Gogs: `sg-git-src.pwtk.cc`, the current public entry, plus `sg-git.pwtk.cc`, `sg-cy-git.caminonode.com`, `sg-git.port888.com`). The token belongs to the dedicated robot, with read access and comment permission for each enabled project. The daemon verifies its API identity. Git uses a host-scoped helper; the model process does not inherit this file path or token. Human account credentials are not used as a fallback.
 
 ## Two-person eligibility (not yet a native Gogs merge lock)
 
